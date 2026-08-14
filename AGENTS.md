@@ -1,5 +1,10 @@
 # xTokens 开发与协作规范
 
+## 背景
+高效、简洁、易用的LLM推理系统
+
+
+
 ## Commit 规范
 
 遵循 [Conventional Commits](https://www.conventionalcommits.org/zh-hans/) 格式：

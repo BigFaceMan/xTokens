@@ -1,0 +1,7 @@
+[project]
+name = "x-tokens"
+version = "0.1.0"
+description = "An efficient, lightweight, and easy-to-use LLM inference system"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []

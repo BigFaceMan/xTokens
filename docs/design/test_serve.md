@@ -4,6 +4,19 @@
 
 `test_serve` 是一个独立的异步 benchmark client，用于压测已经运行的 OpenAI-compatible HTTP 服务。它不导入、不启动、不配置 vLLM 或 xTokens；模型、GPU、调度器、KV cache 和服务端生命周期均由外部服务负责。
 
+
+**对于系统的性能主要看以下几个方面：**
+
+``` md
+1. 性能
+  1. 用户侧：TTFT、TTOP、TTLT
+  2. 推理侧：Tw、Ts、Tp、Td、ITL
+  3. 系统侧：TQS、QPS、QPM
+2. 效果
+  1. 模型输出的结果是否和naive版本相同
+```
+
+
 ## 1. 功能
 
 ### 1.1 支持的 API

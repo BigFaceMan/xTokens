@@ -27,3 +27,6 @@ venv/
 .idea/
 .vscode/
 *.swp
+
+# workspace
+workspace/

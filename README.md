@@ -6,7 +6,7 @@
 
 
 ## Todo
-- [ ] 搭建测评服务                                                                     
+- [x] 搭建测评服务                                                                     
 - [ ] 设计web api serve                                                                         
 - [ ] 完成 test serve benchmark                                                                    
 - [ ] V0 版本 支持最基本的自回归生成

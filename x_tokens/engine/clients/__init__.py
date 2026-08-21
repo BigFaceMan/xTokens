@@ -1,5 +1,5 @@
-"""Engine Core transport implementations."""
+"""EngineCore client implementations."""
 
-from .local import LocalEngineCoreClient, MockEngineCore
+from .inproc import InprocClient
 
-__all__ = ["LocalEngineCoreClient", "MockEngineCore"]
+__all__ = ["InprocClient"]

@@ -6,7 +6,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 
-from x_tokens.engine.client import EngineClientProtocol
+from x_tokens.engine.llm_engine import LLMEngineProtocol
 from x_tokens.engine.types import (
     EngineEvent,
     ErrorEvent,
@@ -27,7 +27,7 @@ class GenerationService:
 
     def __init__(
         self,
-        engine: EngineClientProtocol,
+        engine: LLMEngineProtocol,
         models: ModelRegistry,
         *,
         shutdown_policy: str = "abort",
@@ -88,7 +88,7 @@ class GenerationService:
 class ChatCompletionService(GenerationService):
     def __init__(
         self,
-        engine: EngineClientProtocol,
+        engine: LLMEngineProtocol,
         models: ModelRegistry,
         renderer: PromptRenderer,
         *,

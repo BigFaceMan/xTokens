@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 
 from fastapi.testclient import TestClient
 
+from x_tokens.core.scheduler import ScheduledRequest, SchedulingBatch
 from x_tokens.engine.types import (
     EngineEvent,
     EngineHealth,
@@ -16,8 +17,10 @@ from x_tokens.engine.types import (
     TokenEvent,
 )
 from x_tokens.entrypoints.serve import ServeConfig, create_app
+from x_tokens.entrypoints.serve import app as serve_app
 from x_tokens.entrypoints.serve.generation import GenerationService
 from x_tokens.entrypoints.serve.models import ModelRegistry
+from x_tokens.executor.base import Executor
 
 
 class FakeEngine:
@@ -49,6 +52,21 @@ class FakeEngine:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class FakeExecutor(Executor):
+    eos_token_ids = frozenset((9,))
+
+    def encode(self, prompt: str | tuple[int, ...]) -> tuple[int, ...]:
+        del prompt
+        return (1,)
+
+    def execute(self, batch: SchedulingBatch) -> tuple[int, ...]:
+        return tuple(9 for _ in batch.requests)
+
+    def decode_delta(self, request: ScheduledRequest) -> str:
+        del request
+        return ""
 
 
 def client_for(engine: FakeEngine, **config: object) -> TestClient:
@@ -129,3 +147,17 @@ def test_unfinished_event_stream_aborts_request() -> None:
 
     asyncio.run(close_early())
     assert engine.aborted == ["cancel-me"]
+
+
+def test_default_factory_uses_inproc_llm_engine(monkeypatch) -> None:
+    monkeypatch.setattr(serve_app, "HFExecutor", lambda _: FakeExecutor())
+    app = create_app(ServeConfig(served_model_name="test-model"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/completions",
+            json={"model": "test-model", "prompt": "hello"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "stop"

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from x_tokens.engine.client import EngineClientProtocol
+from x_tokens.engine.llm_engine import LLMEngineProtocol
 from x_tokens.engine.types import EngineEvent, ErrorEvent
 
 from ..config import ServeConfig
@@ -37,7 +37,7 @@ router = APIRouter()
 @dataclass(slots=True)
 class ServeServices:
     config: ServeConfig
-    engine: EngineClientProtocol
+    engine: LLMEngineProtocol
     models: ModelRegistry
     completions: GenerationService
     chat: ChatCompletionService

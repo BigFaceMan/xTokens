@@ -11,8 +11,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from x_tokens.engine.client import EngineClient, EngineClientProtocol
-from x_tokens.engine.clients.local import LocalEngineCoreClient
+from x_tokens.core import EngineCoreConfig
+from x_tokens.engine.clients.inproc import InprocClient
+from x_tokens.engine.llm_engine import LLMEngine, LLMEngineProtocol
+from x_tokens.executor.hf import HFExecutor, HFExecutorConfig
 
 from .config import ServeConfig
 from .errors import OpenAIError
@@ -21,7 +23,7 @@ from .models import ModelRegistry
 from .openai.routes import ServeServices, router
 from .renderer import PlainTextPromptRenderer
 
-EngineFactory = Callable[[ServeConfig], EngineClientProtocol]
+EngineFactory = Callable[[ServeConfig], LLMEngineProtocol]
 
 
 class RequestBodyLimitMiddleware(BaseHTTPMiddleware):
@@ -44,10 +46,22 @@ class RequestBodyLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def default_engine_factory(config: ServeConfig) -> EngineClientProtocol:
-    """Use a GPU-free Core transport mock until EngineCore is implemented."""
-    return EngineClient(
-        LocalEngineCoreClient(output_queue_size=config.output_queue_size)
+def default_engine_factory(config: ServeConfig) -> LLMEngineProtocol:
+    """Build the single-process Hugging Face EngineCore path."""
+    return LLMEngine(
+        InprocClient(
+            EngineCoreConfig(
+                (config.served_model_name,), max_num_seqs=config.hf_max_num_seqs
+            ),
+            lambda: HFExecutor(
+                HFExecutorConfig(
+                    config.hf_model or config.served_model_name,
+                    device=config.hf_device,
+                    dtype=config.hf_dtype,
+                    local_files_only=config.hf_local_files_only,
+                )
+            ),
+        )
     )
 
 

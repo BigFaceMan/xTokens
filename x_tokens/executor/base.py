@@ -2,20 +2,33 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from x_tokens.core.scheduler import ScheduledRequest, SchedulingBatch
+    from x_tokens.core.scheduler import SchedulerOutput
 
 
 class Executor(Protocol):
-    """Tokenization, one-step execution, and decoding for a model backend."""
+    """Model execution backend consumed by EngineCore."""
 
     @property
     def eos_token_ids(self) -> frozenset[int]: ...
 
-    def encode(self, prompt: str | tuple[int, ...]) -> tuple[int, ...]: ...
+    def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput: ...
 
-    def execute(self, batch: SchedulingBatch) -> tuple[int, ...]: ...
+    def sample_tokens(
+        self, output: ModelForwardOutput, batch: SchedulerOutput
+    ) -> tuple[int, ...]: ...
 
-    def decode_delta(self, request: ScheduledRequest) -> str: ...
+
+@dataclass(frozen=True, slots=True)
+class ModelForwardOutput:
+    """Normalized output of one model forward pass.
+
+    ``logits`` contains the final-position logits for each request in batch
+    order. Optional model state is reserved for future KV-cache executors.
+    """
+
+    logits: Any
+    past_key_values: Any | None = None

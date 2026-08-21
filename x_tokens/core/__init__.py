@@ -1,13 +1,14 @@
 """Backend-independent Core scheduling loop and command protocol."""
 
 from .config import EngineCoreConfig
-from .engine_core import EngineCore, EngineCoreOutputs, RequestWave
+from .engine_core import EngineCore, EngineCoreOutputs
 from .scheduler import (
     NaiveScheduler,
     RequestStatus,
     ScheduledRequest,
+    Scheduler,
+    SchedulerOutput,
     SchedulerUpdate,
-    SchedulingBatch,
 )
 
 __all__ = [
@@ -16,8 +17,8 @@ __all__ = [
     "EngineCoreOutputs",
     "NaiveScheduler",
     "RequestStatus",
-    "RequestWave",
     "ScheduledRequest",
+    "Scheduler",
+    "SchedulerOutput",
     "SchedulerUpdate",
-    "SchedulingBatch",
 ]

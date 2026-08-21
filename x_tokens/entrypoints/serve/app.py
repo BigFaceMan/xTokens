@@ -11,10 +11,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from x_tokens.core import EngineCoreConfig
-from x_tokens.engine.clients.inproc import InprocClient
+from x_tokens.config import XTokensConfig
+from x_tokens.core import EngineCoreConfig, NaiveScheduler, Scheduler
+from x_tokens.engine.clients.inproc import InprocClient, SchedulerFactory
+from x_tokens.engine.input_processor import TokenizerInputProcessor
 from x_tokens.engine.llm_engine import LLMEngine, LLMEngineProtocol
-from x_tokens.executor.hf import HFExecutor, HFExecutorConfig
+from x_tokens.engine.output_processor import TokenizerOutputProcessor
+from x_tokens.executor.base import Executor
+from x_tokens.executor.naive_hf_executor import (
+    NaiveHFExecutor,
+    NaiveHFExecutorConfig,
+)
 
 from .config import ServeConfig
 from .errors import OpenAIError
@@ -23,7 +30,19 @@ from .models import ModelRegistry
 from .openai.routes import ServeServices, router
 from .renderer import PlainTextPromptRenderer
 
-EngineFactory = Callable[[ServeConfig], LLMEngineProtocol]
+EngineFactory = Callable[[XTokensConfig], LLMEngineProtocol]
+ExecutorFactory = Callable[[NaiveHFExecutorConfig], Executor]
+
+
+def _default_executor_factory(config: NaiveHFExecutorConfig) -> NaiveHFExecutor:
+    return NaiveHFExecutor(config)
+
+
+def _default_scheduler_factory(config: EngineCoreConfig) -> Scheduler:
+    return NaiveScheduler(
+        max_num_seqs=config.max_num_seqs,
+        max_model_len=config.max_model_len,
+    )
 
 
 class RequestBodyLimitMiddleware(BaseHTTPMiddleware):
@@ -46,22 +65,41 @@ class RequestBodyLimitMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-def default_engine_factory(config: ServeConfig) -> LLMEngineProtocol:
+def default_engine_factory(
+    config: XTokensConfig,
+    *,
+    executor_factory: ExecutorFactory = _default_executor_factory,
+    scheduler_factory: SchedulerFactory = _default_scheduler_factory,
+) -> LLMEngineProtocol:
     """Build the single-process Hugging Face EngineCore path."""
+    model_config = config.model_config
+    executor_config = config.executor_config
+    processor = TokenizerInputProcessor.from_config(
+        model_config.model_name,
+        local_files_only=executor_config.local_files_only,
+    )
+    hf_executor_config = NaiveHFExecutorConfig(
+        model_config.model_name,
+        device=executor_config.device,
+        dtype=executor_config.dtype,
+        local_files_only=executor_config.local_files_only,
+        pad_token_id=processor.pad_token_id,
+        eos_token_ids=processor.eos_token_ids,
+    )
+    executor = executor_factory(hf_executor_config)
+    core_config = EngineCoreConfig(
+        (model_config.served_model_name,),
+        max_model_len=model_config.max_model_len,
+        max_num_seqs=config.scheduler_config.max_num_seqs,
+    )
     return LLMEngine(
         InprocClient(
-            EngineCoreConfig(
-                (config.served_model_name,), max_num_seqs=config.hf_max_num_seqs
-            ),
-            lambda: HFExecutor(
-                HFExecutorConfig(
-                    config.hf_model or config.served_model_name,
-                    device=config.hf_device,
-                    dtype=config.hf_dtype,
-                    local_files_only=config.hf_local_files_only,
-                )
-            ),
-        )
+            core_config,
+            lambda: executor,
+            scheduler_factory=scheduler_factory,
+        ),
+        processor,
+        TokenizerOutputProcessor(processor.tokenizer),
     )
 
 
@@ -79,31 +117,35 @@ def _validation_error(exc: RequestValidationError) -> OpenAIError:
 
 
 def create_app(
-    config: ServeConfig | None = None,
+    config: XTokensConfig | ServeConfig | None = None,
     engine_factory: EngineFactory = default_engine_factory,
 ) -> FastAPI:
     """Create an app with injected Engine dependencies and no module-global Engine."""
-    config = config or ServeConfig()
+    if config is None:
+        config = XTokensConfig()
+    elif isinstance(config, ServeConfig):
+        config = config.to_xtokens_config()
+    server_config = config.server_config
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         engine = engine_factory(config)
-        models = ModelRegistry(config.served_model_name)
+        models = ModelRegistry(config.model_config.served_model_name)
         completions = GenerationService(
             engine,
             models,
-            shutdown_policy=config.shutdown_policy,
-            shutdown_timeout_s=config.shutdown_timeout_s,
+            shutdown_policy=server_config.shutdown_policy,
+            shutdown_timeout_s=server_config.shutdown_timeout_s,
         )
         chat = ChatCompletionService(
             engine,
             models,
             PlainTextPromptRenderer(),
-            shutdown_policy=config.shutdown_policy,
-            shutdown_timeout_s=config.shutdown_timeout_s,
+            shutdown_policy=server_config.shutdown_policy,
+            shutdown_timeout_s=server_config.shutdown_timeout_s,
         )
         app.state.serve_services = ServeServices(
-            config, engine, models, completions, chat
+            server_config, engine, models, completions, chat
         )
         await completions.refresh_readiness()
         try:
@@ -113,12 +155,12 @@ def create_app(
 
     app = FastAPI(title="xTokens Serve API", lifespan=lifespan)
     app.add_middleware(
-        RequestBodyLimitMiddleware, max_body_size=config.max_request_body_size
+        RequestBodyLimitMiddleware, max_body_size=server_config.max_request_body_size
     )
-    if config.cors_origins:
+    if server_config.cors_origins:
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=list(config.cors_origins),
+            allow_origins=list(server_config.cors_origins),
             allow_methods=["GET", "POST"],
             allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
         )

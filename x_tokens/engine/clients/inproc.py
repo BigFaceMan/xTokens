@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from x_tokens.core import EngineCore, EngineCoreConfig
+from x_tokens.core import EngineCore, EngineCoreConfig, NaiveScheduler, Scheduler
 from x_tokens.engine.core_client import EngineCoreClient
 from x_tokens.engine.types import CoreEvent, EngineHealth, GenerateRequest
 from x_tokens.executor.base import Executor
 
 ExecutorFactory = Callable[[], Executor]
+SchedulerFactory = Callable[[EngineCoreConfig], Scheduler]
 
 
 class InprocClient(EngineCoreClient):
@@ -21,14 +22,26 @@ class InprocClient(EngineCoreClient):
     """
 
     def __init__(
-        self, config: EngineCoreConfig, executor_factory: ExecutorFactory
+        self,
+        config: EngineCoreConfig,
+        executor_factory: ExecutorFactory,
+        scheduler_factory: SchedulerFactory | None = None,
     ) -> None:
-        self.engine_core = EngineCore(config, executor=executor_factory())
+        scheduler = (
+            scheduler_factory(config)
+            if scheduler_factory is not None
+            else NaiveScheduler(
+                max_num_seqs=config.max_num_seqs,
+                max_model_len=config.max_model_len,
+            )
+        )
+        self.engine_core = EngineCore(
+            config, executor=executor_factory(), scheduler=scheduler
+        )
         self._closed = False
 
     def add_request(self, request: GenerateRequest) -> None:
-        req, request_wave = self.engine_core.preprocess_add_request(request)
-        self.engine_core.add_request(req, request_wave)
+        self.engine_core.add_request(request)
 
     def get_output(self) -> tuple[CoreEvent, ...]:
         if self._closed:

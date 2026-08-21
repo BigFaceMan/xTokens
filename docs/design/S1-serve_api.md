@@ -1,108 +1,192 @@
-# xTokens Serve API 设计
+# 构建 OpenAI-compatible Serve API 与 SSE 流式服务
 
 ## 1. 背景
 
-xTokens 需要一个 OpenAI-compatible HTTP 服务入口，提供模型发现、completion 和 chat
-completion 接口。Serve 层负责 HTTP、SSE 与 OpenAI 协议转换；它不应参与模型执行、调度、
-continuous batching、KV cache 或 CUDA 资源管理。
+xTokens 提供 OpenAI-compatible HTTP 服务，以暴露模型发现、text completion 与 chat completion
+能力。Serve 层负责 HTTP 请求处理、OpenAI DTO 转换、SSE 编码和应用生命周期；模型执行、调度和
+请求状态归属于 Engine/Core 层。
 
-当前尚未实现真实 `EngineCore`。为了先验证 Serve API 的协议、异步流、取消和 backpressure，
-默认运行时使用不依赖 GPU 的 `MockEngineCore`。它保留未来真实 Core 所需的 producer 形状：请求经
-`submit()` 进入 Core，输出从唯一的 `outputs()` 全局异步流返回。
+当前实现已具备单进程的 Hugging Face 执行路径。旧设计中基于 `MockEngineCore`、全局异步输出流、
+私有有界队列及 dispatcher 的描述已经不适用。当前重构将输入预处理从 `EngineCore` 移至
+`LLMEngine`：Engine 通过 `InputProcessor` 将文本或 token IDs 规范化为 token IDs，再经同步的
+`EngineCoreClient` 驱动 `InprocClient` 与 `EngineCore`。
 
-预期收益：Serve 协议可独立于推理引擎迭代；HTTP 测试无需模型或 GPU；真实本地 Core 或 RPC
-transport 接入时无需重写路由和 OpenAI adapter。
+该分层使 OpenAI API 与 Core 的执行实现解耦，同时为后续替换为进程间或远程的
+`EngineCoreClient` transport 保留边界。
 
-## 2. 目标 / 非目标
+## 2. 目标
 
-### 目标
-
-- 提供 `GET /live`、`GET /ready`、`GET /v1/models`、`POST /v1/completions` 和
+- 提供 `GET /live`、`GET /ready`、`GET /v1/models`、`POST /v1/completions` 与
   `POST /v1/chat/completions`。
-- 支持 OpenAI-compatible 流式与非流式生成、`X-Request-ID`、usage、基础 sampling 参数、API key、
-  CORS、请求大小限制和标准错误 envelope。
-- 使用 `text/event-stream` 实现 SSE；首个 `ErrorEvent` 在响应开始前返回 JSON error，响应开始后
-  返回 SSE error event，再以 `data: [DONE]` 结束。
-- 每个请求使用唯一 `request_id`，将 Core 全局输出按 ID 分发到私有有界队列；慢 SSE consumer
-  不得阻塞其他请求。
-- 客户端断连、超时和应用关闭最终调用幂等的 `abort(request_id)`。
-- `entrypoints/serve` 只依赖 `EngineClientProtocol`，`engine` 不依赖 FastAPI 或 OpenAI HTTP DTO。
-
-### 非目标
-
-- 真实 `EngineCore`、scheduler、continuous batching、KV cache、模型加载和 CUDA 执行。
-- RPC/multiprocess transport、多个 Web worker 共享 Engine。
-- 多模型动态加载、LoRA、prefix cache、profiling 等控制面 API。
-- 完整 OpenAI API、tool call、多模态 content、reasoning content 和模型专用 chat template。
-- 指标 exporter、trace、Engine request log 和性能基准实现。
+- 以 `LLMEngineProtocol` 作为 Serve 到 Engine 的依赖边界，以 `EngineCoreClient` 作为 Engine
+  到 Core/transport 的边界。
+- 支持 OpenAI-compatible 的流式 SSE 与非流式 JSON 响应、usage、基础 sampling 参数、API key、
+  CORS、请求体大小限制和 OpenAI error envelope。
+- 用 async generator 将 Engine 事件逐个转换并传给 FastAPI `StreamingResponse`；流式响应以
+  `data: [DONE]` 结束。
+- 在客户端断连、请求提前关闭或应用退出时取消未完成的 Core 请求。
+- 将 chat template、tokenization、token-ID 输入校验和 token 增量解码放在 Engine 输入处理边界；
+  `EngineCore` 只接收 token IDs 并执行调度与模型前向。
+- 当前范围限于单进程、单个已加载模型的 HF Core 路径；不包含 RPC transport、多 worker 模型共享、
+  LoRA、多模态或完整 OpenAI API。
 
 ## 3. 整体设计
 
-### 架构图
-
-当前默认路径使用 mock；虚线为未来真实 Core 的替换点。
+### 3.1 架构和职责
 
 ```mermaid
 flowchart LR
-    Client[OpenAI-compatible client] --> App[FastAPI app]
-    App --> Routes[OpenAI routes]
-    Routes --> Service[GenerationService]
-    Service --> Engine[EngineClient]
-    Engine --> CoreClient[LocalEngineCoreClient]
-    CoreClient --> Mock[MockEngineCore]
-    CoreClient -. implements CoreOutputSource .-> Core[future EngineCore]
+    Client[OpenAI-compatible client] --> Server[FastAPI API Server]
+    Server --> Service[GenerationService / ChatCompletionService]
+    Service --> Engine[LLMEngine]
+    Engine --> Processor[InputProcessor]
+    Engine --> OutputProcessor[OutputProcessor]
+    Engine --> ClientAdapter[EngineCoreClient]
+    ClientAdapter --> Inproc[InprocClient]
+    Inproc --> Core[EngineCore]
+    Core --> Scheduler[Scheduler protocol]
+    Scheduler -. default .-> Naive[NaiveScheduler]
+    Core --> Executor[NaiveHFExecutor]
 ```
 
-依赖方向为 `entrypoints/serve -> engine -> CoreOutputSource contract`。未来 Core 实现依赖该
-contract，但不依赖 `entrypoints/serve`、FastAPI 或 OpenAI DTO。
-
-### 核心模块
-
-| 模块 | 当前职责 |
+| 模块 | 职责 |
 | --- | --- |
-| `x_tokens/entrypoints/serve/app.py` | `create_app()`、lifespan、CORS、body size 和 exception handler |
-| `entrypoints/serve/openai` | OpenAI Pydantic DTO、路由、request/response adapter、SSE 编码 |
-| `entrypoints/serve/generation.py` | ready gate、活动请求、取消和 shutdown 策略 |
-| `entrypoints/serve/models.py` / `renderer.py` | 单模型注册表与纯文本 chat prompt 渲染 |
-| `x_tokens/engine/client.py` | `EngineClientProtocol` 与默认 `EngineClient`，`CoreEvent` 到 `EngineEvent` 归一化 |
-| `x_tokens/engine/core_client.py` | Core contract、请求注册表、私有队列、全局 output dispatcher 和 `DispatchMetrics` |
-| `x_tokens/engine/clients/local.py` | `MockEngineCore` 与 `LocalEngineCoreClient` |
+| API Server | 在 `app.py` 创建 FastAPI app、初始化依赖、配置 CORS/请求体限制和异常处理。 |
+| OpenAI routes/adapter | 校验 HTTP DTO、鉴权、生成 request ID、构造响应，并负责 JSON/SSE wire format。 |
+| `GenerationService` | 模型准入与 ready gate、活动请求跟踪、异常归一化、取消和 shutdown 策略。 |
+| `LLMEngine` | 面向 Serve 的异步生成 facade；异步执行输入预处理、提交 token IDs、按 request ID 暂存/分发 Core 输出。 |
+| `InputProcessor` | 在 Engine 侧执行文本 tokenization、已提供 token IDs 的规范化和输入校验。 |
+| `OutputProcessor` | 在 Engine 侧维护每请求 detokenization 状态，将生成 token IDs 增量转换为文本，并在请求结束时清理状态。 |
+| `EngineCoreClient` | 同步 transport contract。当前 `InprocClient` 直接调用 Core；未来可替换为 IPC/RPC client。 |
+| `EngineCore` | 通用的同步推理后端：接收已处理 token IDs，执行 `NaiveScheduler` 调度、调用 executor、生成 token ID/终止事件和资源关闭。 |
+| `NaiveHFExecutor` | Hugging Face 的朴素 executor：每 step 对完整上下文执行一次无 KV cache 前向、采样下一个 token ID。 |
 
-默认 CLI 为：
+依赖方向为 `entrypoints/serve -> engine -> core/executor`。Core 与 Engine 不依赖 FastAPI、
+SSE 或 OpenAI DTO。
 
-```bash
-python -m x_tokens --model x-tokens-mock --port 8000
-```
+### 3.2 当前单进程数据流
 
-`ServeConfig.engine_mode` 当前仅允许 `local`。`--output-queue-size` 控制每个请求的输出队列容量，
-默认值为 32。
+`LLMEngine` 首先在 `asyncio.to_thread()` 中调用 `InputProcessor.process()`；这一步生成 token IDs，
+不会阻塞 Core 的调度/执行调用。`InprocClient.get_output()` 是 pull 接口：它调用一次 `EngineCore.step_fn()`，然后调用
+`post_step()`，并返回 channel `0` 在本 step 产生的 `CoreEvent`。因此当前 Core 没有独立后台
+producer、全局 `AsyncIterator`、dispatcher task 或每请求输出队列。
 
-### 数据流
-
-`MockEngineCore` 为每个 `submit()` 启动独立 producer task，但只暴露一个全局输出流。唯一的
-`QueuedEngineCoreClient` dispatcher 消费该流，并以 `request_id` 路由到请求私有队列。
+`LLMEngine.generate()` 返回 async generator。某个 generator 需要事件时，它从本地
+`_pending_events` 取该 request 的缓存；缓存为空时调用 `get_output()` 推进一个 Core step，按
+`request_id` 把该 step 的所有输出分发到 `_pending_events`，再只 yield 当前请求的事件。其他请求
+的输出会留在各自的 pending deque 中，等待相应 generator 消费。
 
 ```mermaid
-flowchart LR
-    Core[MockEngineCore] --> Output[global AsyncIterator CoreEvent]
-    Output --> Dispatch[QueuedEngineCoreClient dispatcher]
-    Dispatch --> Registry[request_id to RequestState]
-    Registry --> QueueA[request A bounded queue]
-    Registry --> QueueB[request B bounded queue]
-    QueueA --> EngineA[EngineClient.generate]
-    QueueB --> EngineB[EngineClient.generate]
-    EngineA --> SSEA[SSE response A]
-    EngineB --> SSEB[SSE response B]
+flowchart TD
+    G[LLMEngine async generator] --> P{pending event for request?}
+    P -->|yes| N[normalize CoreEvent to EngineEvent]
+    P -->|no| O[EngineCoreClient.get_output]
+    O --> S[EngineCore.step_fn and post_step]
+    S --> D[LLMEngine dispatch by request_id]
+    D --> P
+    N --> A[OpenAI adapter]
+    A --> J[JSON response or SSE chunk]
 ```
 
-这样 SSE 连接只消费自身请求的事件；Core producer 和 dispatcher 不等待任何单个 HTTP 客户端。
+`NaiveScheduler` 以 FIFO 将 waiting 请求纳入 running 集合，最多同时运行 `hf_max_num_seqs`
+个序列；每次 Core step 对当前 running batch 执行一次模型前向，并产生每个请求的 token 或终止事件。
+它是基础连续批处理实现，但当前没有 KV cache、优先级调度或抢占。
 
 ## 4. 详细设计
 
-### 接口与数据结构
+### 4.1 核心流程
 
-HTTP DTO 在 `entrypoints/serve/openai/protocol.py`，进入 Engine 前转换为与 HTTP 无关的
-`GenerateRequest` 和 `SamplingParams`。Core 输出与 Serve 输出分开建模，避免 Core 依赖 OpenAI。
+#### 请求、调度与事件
+
+1. Route 校验 API key、模型名和 Engine readiness，从 `X-Request-ID` 读取 ID；未提供时生成
+   `cmpl-<uuid>` 或 `chatcmpl-<uuid>`。
+2. `completion_generate_request()` 或 `chat_generate_request()` 将 OpenAI 请求转换为
+   `GenerateRequest`。chat 请求先由 `PlainTextPromptRenderer` 渲染为纯文本 prompt。
+3. `GenerationService.events()` 记录活动 request ID，并迭代 `LLMEngine.generate()`。
+4. `LLMEngine` 在线程中调用 `InputProcessor.process()`，将文本 prompt 编码为 token IDs，或校验
+   已提供的 token IDs。预处理失败变为请求级 `ErrorEvent`，不会进入 Core。
+5. `LLMEngine` 调用 `EngineCoreClient.add_request()`；`InprocClient` 直接调用
+   `EngineCore.add_request()` 入队。Core 只校验模型名和调度约束，入队失败会变为 `CoreErrorEvent`。
+6. Engine 按需调用 `get_output()`。Core 调度 batch、调用 executor、更新 scheduler，并输出
+   `CoreTokenEvent`、`CoreFinishedEvent` 或 `CoreErrorEvent`。
+7. Engine 调用 `OutputProcessor.process_token()` 将 Core token ID 转为文本，并归一化为
+   `TokenEvent`、`FinishedEvent` 或 `ErrorEvent`。终止事件结束该
+   request 的 generator；若 generator 在终止前结束，`finally` 调用 `abort_requests()`。
+
+#### 非流式响应
+
+Route 使用 `collect_events()` 聚合 `TokenEvent.text`，收到 `FinishedEvent` 后返回一次 JSON 响应
+和 usage。`ErrorEvent`、没有终止事件或超时分别转换为 OpenAI error；超时状态码为 504。
+
+#### SSE 流式响应
+
+Route 会先预取第一个 Engine 事件。若首事件为 `ErrorEvent`，在 HTTP 响应开始前返回 JSON error；
+否则将事件重新放回流中，依次传给 `completion_sse()` 或 `chat_sse()`。二者都是 async generator，
+每次 `yield` 已编码的 `data: <json>\n\n` 字符串；`StreamingResponse` 将其写入
+`text/event-stream` 响应。
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as FastAPI route
+    participant GS as GenerationService
+    participant LE as LLMEngine
+    participant EC as InprocClient
+    participant Core as EngineCore
+
+    C->>R: POST /v1/chat/completions, stream=true
+    R->>GS: events(GenerateRequest)
+    GS->>LE: generate(request)
+    LE->>LE: InputProcessor.process in worker thread
+    LE->>EC: add_request(request with token IDs)
+    EC->>Core: add_request with token IDs
+    loop until terminal event
+        LE->>EC: get_output()
+        EC->>Core: step_fn(), post_step()
+        Core-->>LE: CoreEvent tuple
+        LE-->>GS: EngineEvent
+        GS-->>R: EngineEvent
+        R-->>C: SSE data chunk
+    end
+    R-->>C: data: [DONE]
+```
+
+`chat_sse()` 的首个 token chunk 额外携带 `delta.role = "assistant"`；终止 chunk 携带
+`finish_reason`。当 `stream_options.include_usage=true` 时，终止 chunk 后、`[DONE]` 前追加一个
+`choices: []` 的 usage chunk。SSE 头包括 `Cache-Control: no-cache`、`Connection: keep-alive`
+和 `X-Accel-Buffering: no`。
+
+流式期间 `_disconnect_aware()` 在每个事件发送前检查连接状态。`_stream_with_timeout()` 对整个
+SSE body 应用 `request_timeout_s`；超时或未处理异常后尽力输出 SSE error event 和 `[DONE]`。
+由于 `GenerationService.events()` 的 `finally`，正常完成之外的 generator 关闭路径都会请求取消。
+
+### 4.2 接口 / 数据结构
+
+```python
+class LLMEngineProtocol(Protocol):
+    def generate(self, request: GenerateRequest) -> AsyncIterator[EngineEvent]: ...
+    async def abort(self, request_id: str) -> None: ...
+    async def health(self) -> EngineHealth: ...
+    async def close(self) -> None: ...
+
+class EngineCoreClient(Protocol):
+    def add_request(self, request: GenerateRequest) -> None: ...
+    def get_output(self) -> tuple[CoreEvent, ...]: ...
+    def abort_requests(self, request_ids: tuple[str, ...]) -> None: ...
+    def health(self) -> EngineHealth: ...
+    def close(self) -> None: ...
+```
+
+```python
+class InputProcessor(Protocol):
+    def process(self, request: GenerateRequest) -> GenerateRequest: ...
+```
+
+```python
+class OutputProcessor(Protocol):
+    def process_token(self, request_id: str, token_id: int) -> str: ...
+    def finish(self, request_id: str) -> None: ...
+```
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -114,190 +198,203 @@ class GenerateRequest:
     priority: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
 
-
 EngineEvent = TokenEvent | FinishedEvent | ErrorEvent
 CoreEvent = CoreTokenEvent | CoreFinishedEvent | CoreErrorEvent
 ```
 
-`FinishedEvent` 包含 `FinishReason`、prompt token 数和 completion token 数；adapter 用这些值生成
-usage。`ErrorEvent` 是终止事件。正常请求应产生一个 `FinishedEvent`，其后不再产生 token。
-
-核心接口如下：
-
-```python
-class EngineClientProtocol(Protocol):
-    def generate(self, request: GenerateRequest) -> AsyncIterator[EngineEvent]: ...
-    async def abort(self, request_id: str) -> None: ...
-    async def health(self) -> EngineHealth: ...
-    async def close(self) -> None: ...
-
-
-class EngineCoreClient(Protocol):
-    def submit(self, request: GenerateRequest) -> AsyncIterator[CoreEvent]: ...
-    async def abort(self, request_id: str) -> None: ...
-    async def health(self) -> EngineHealth: ...
-    async def close(self) -> None: ...
-
-
-class CoreOutputSource(Protocol):
-    async def submit(self, request: GenerateRequest) -> None: ...
-    def outputs(self) -> AsyncIterator[CoreEvent]: ...
-    async def abort(self, request_id: str) -> None: ...
-    async def health(self) -> EngineHealth: ...
-    async def close(self) -> None: ...
-```
-
-`EngineClientProtocol` 是 Serve 的依赖注入边界。默认 `EngineClient` 实现它，测试可直接注入
-Fake Engine。`CoreOutputSource` 是未来真实本地 Core 或 RPC transport 必须实现的 producer contract。
+`SamplingParams` 当前包含 `max_tokens`、`temperature`、`top_p`、`top_k` 和 `stop`。`InputProcessor`
+与 Core 都会校验输入；当前不支持 stop string，传入时会产生请求级错误。`FinishedEvent`
+携带 prompt/completion token 数和 `FinishReason`，adapter 据此生成 OpenAI usage。
 
 ```mermaid
 classDiagram
-    class EngineClientProtocol {
+    class LLMEngineProtocol {
         <<protocol>>
         +generate(request) AsyncIterator~EngineEvent~
         +abort(request_id)
         +health() EngineHealth
         +close()
     }
-    class EngineClient
+    class LLMEngine
     class EngineCoreClient {
         <<protocol>>
-        +submit(request) AsyncIterator~CoreEvent~
-        +abort(request_id)
+        +add_request(request)
+        +get_output() tuple~CoreEvent~
+        +abort_requests(request_ids)
+        +health() EngineHealth
+        +close()
     }
-    class QueuedEngineCoreClient
-    class LocalEngineCoreClient
-    class CoreOutputSource {
+    class InputProcessor {
         <<protocol>>
-        +submit(request)
-        +outputs() AsyncIterator~CoreEvent~
+        +process(request) GenerateRequest
     }
-    class MockEngineCore
+    class OutputProcessor {
+        <<protocol>>
+        +process_token(request_id, token_id) str
+        +finish(request_id)
+    }
+    class InprocClient
+    class EngineCore
+    class NaiveScheduler
+    class NaiveHFExecutor
 
-    EngineClient ..|> EngineClientProtocol
-    EngineClient --> EngineCoreClient
-    QueuedEngineCoreClient ..|> EngineCoreClient
-    LocalEngineCoreClient --|> QueuedEngineCoreClient
-    QueuedEngineCoreClient --> CoreOutputSource
-    MockEngineCore ..|> CoreOutputSource
-    LocalEngineCoreClient --> MockEngineCore
+    LLMEngine ..|> LLMEngineProtocol
+    LLMEngine --> EngineCoreClient
+    LLMEngine --> InputProcessor
+    LLMEngine --> OutputProcessor
+    InprocClient ..|> EngineCoreClient
+    InprocClient --> EngineCore
+    EngineCore --> NaiveScheduler
+    EngineCore --> NaiveHFExecutor
 ```
 
-### 请求流程
+### 4.3 生命周期、异常与取消
 
-流式和非流式请求共用 `EngineClient.generate()`。区别仅在 adapter：流式请求逐事件写入 SSE，
-非流式请求聚合 token text 后一次性返回 JSON。
+`create_app()` 的 lifespan 创建一个 Engine、单模型 `ModelRegistry`、completion service 与 chat
+service；启动时调用 `refresh_readiness()`。`/live` 只确认 Web 进程存活，`/ready` 调用
+`LLMEngine.health()`，`InprocClient` 在未关闭时报告 ready。
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant R as FastAPI route
-    participant S as GenerationService
-    participant E as EngineClient
-    participant Q as QueuedEngineCoreClient
-    participant M as MockEngineCore
-    participant D as output dispatcher
+`GenerationService` 捕获未预期的 Engine 异常并产出通用 `ErrorEvent`。它跟踪活动 request ID：
+正常 `FinishedEvent`/`ErrorEvent` 后不再 abort；断连、超时、consumer 提前关闭等非完成路径会在
+`finally` 调用 `LLMEngine.abort()`，随后 Core scheduler 移除 waiting 或 running 请求。`abort` 对
+已完成或未知 ID 无副作用。
 
-    C->>R: POST /v1/*/completions
-    R->>R: validate, auth, model and request_id
-    R->>S: events(GenerateRequest)
-    S->>E: generate(request)
-    E->>Q: submit(request)
-    Q->>M: submit(request)
-    loop generated event
-        M-->>D: CoreEvent on global outputs()
-        D->>Q: route by request_id to private queue
-        Q-->>E: CoreEvent
-        E-->>S: EngineEvent
-        S-->>R: EngineEvent
-        R-->>C: JSON aggregate or SSE data chunk
-    end
-    M-->>D: CoreFinishedEvent or CoreErrorEvent
-    D-->>R: terminal event
-    R-->>C: final chunk and data: [DONE]
-```
-
-路由首先检查 API key 和模型 ready 状态，并从 `X-Request-ID` 读取 ID；没有 header 时分别生成
-`cmpl-*` 或 `chatcmpl-*`。chat 路由先通过 `PlainTextPromptRenderer` 将消息按
-`"{role}: {content}"` 行拼接，再创建 `GenerateRequest`。
-
-### SSE、错误和取消
-
-SSE 由 `encode_sse()` 编码，每条消息为 `data: <json>\n\n`，并设置 `Cache-Control: no-cache`、
-`Connection: keep-alive` 和 `X-Accel-Buffering: no`。结束标识为 `data: [DONE]`；
-`stream_options.include_usage=true` 时，在完成事件后追加 usage chunk。
-
-| 场景 | 行为 |
-| --- | --- |
-| 第一个 Engine event 是错误 | 返回 JSON OpenAI error，不创建 SSE 响应 |
-| SSE 已开始后发生错误 | 写入 SSE error，再写入 `[DONE]` |
-| 非流式 Engine error | 返回 OpenAI error |
-| 请求超时 | 非流式返回 504；流式返回 SSE timeout error 和 `[DONE]` |
-| 客户端断连或 generator 提前关闭 | `GenerationService` 在 `finally` 调用 `abort(request_id)` |
-| shutdown | 按 `abort` 或 `drain` 策略停止活动请求，再关闭 Engine |
-
-`abort()` 必须幂等。当前 disconnect 在每次事件发送前检测；这样能终止持续产生输出的请求。
-
-### Backpressure 与生命周期
-
-`QueuedEngineCoreClient` 的 `RequestState` 持有有界 `asyncio.Queue[CoreEvent]`、terminal 状态和
-terminal delivery task。普通 token 使用 `put_nowait()`；队列满时 dispatcher 标记请求 terminal、
-异步调用 Core `abort(request_id)`，等待队列重新可写后投递 `CoreErrorEvent`。其他请求仍继续分发。
-
-`DispatchMetrics` 在内存中记录：`active_requests`、`unknown_request_events`、
-`slow_consumer_cancellations` 和 `output_queue_blocked_seconds`。完成、错误、abort 和关闭都会删除
-对应注册表项。
-
-应用通过 `create_app()` 的 lifespan 创建 `EngineClient(LocalEngineCoreClient(...))`、模型注册表和
-service。`/live` 仅检查 Web 进程；`/ready` 调用 `EngineClient.health()`，当前 mock 在未关闭时 ready。
-关闭时先停止 service 接收工作，`drain` 等待到 timeout 后取消，`abort` 立即取消，最后关闭共享
-`EngineClient` 与 `MockEngineCore`。真实 Core 接入后，其 `close()` 还需要负责 worker、模型和 KV cache。
+关闭时，service 先停止接受新工作。`shutdown_policy="abort"` 立即取消活动请求；`"drain"` 最多等待
+`shutdown_timeout_s`，超时后再取消。最后 `LLMEngine.close()` 取消其活跃请求并关闭 Core；
+`EngineCore.close()` abort 所有 scheduler 请求。
 
 ## 5. 测试与验证
 
-测试不依赖 GPU。当前测试集共 14 个测试，覆盖：
+现有测试覆盖 Serve 与单进程 Core 路径：
 
-- `tests/entrypoints/serve/test_app.py`：request ID、OpenAI validation error、API key、ready gate、
-  shutdown、chat SSE、流中 Engine error 与提前关闭的 abort。
-- `tests/engine/test_core_client.py`：交错 Core 输出的 request ID 分流、慢 consumer 取消、其他请求
-  继续推进、Core 输出流失败、重复 abort、注册表清理和 `CoreEvent -> EngineEvent` 归一化。
-- `benchmarks/test_serve/tests`：模型发现和 OpenAI chat SSE 解析。
+- `tests/entrypoints/serve/test_app.py`：模型列表、request ID、验证错误、API key、ready gate、
+  shutdown、chat SSE、流式 Engine error 与 generator 提前关闭时的 abort。
+- `tests/engine/test_inproc_client.py`：`InprocClient` 与 `EngineCore` 的请求提交、执行、输出及关闭。
+- `tests/engine/test_hf_core.py`：`EngineCore` 对已处理 token IDs 的调度、token/finish/error 事件与采样参数校验。
+- `tests/engine/test_input_processor.py`：文本和 token-ID prompt 的处理、输入错误，以及 `OutputProcessor` 的增量解码和状态清理。
+- `tests/engine/test_scheduler.py`：FIFO 调度、并发序列上限、完成、失败和 abort。
 
-执行：
+建议执行：
 
 ```bash
 uv run ruff check x_tokens tests
 uv run ruff format --check x_tokens tests
-uv run pytest -q tests benchmarks/test_serve/tests
+uv run pytest -q tests
 uv build
 ```
 
 最小手工验证：
 
 ```bash
-python -m x_tokens --model x-tokens-mock --port 8000
+python -m x_tokens --model <hf-model-or-alias> --port 8000
 curl http://127.0.0.1:8000/v1/models
 curl -N http://127.0.0.1:8000/v1/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"x-tokens-mock","prompt":"hello","stream":true}'
+  -d '{"model":"<served-model-name>","prompt":"hello","stream":true}'
 ```
 
-验收条件：非流式请求返回 OpenAI-compatible JSON 和 usage；流式响应是有效 SSE 且以 `[DONE]` 结束；
-多个请求的输出不串流；慢客户端只影响自身；未完成请求最终触发 abort；`/ready` 在 Engine 不 ready 时返回
-503。
+验收条件：非流式请求返回 OpenAI-compatible JSON 和 usage；流式响应每条事件符合 SSE 格式且以
+`[DONE]` 结束；batch 中不同 request ID 的输出不会被错误地交给其他 generator；断连、超时和关闭会
+移除未完成 Core 请求。
 
 ## 6. Trade-offs / 已知问题
 
-- 当前 `MockEngineCore` 只按固定文本分词输出，不执行真实 tokenization、sampling 或模型推理；它验证
-  transport 行为，不代表真实推理性能或 token 语义。
-- 当前只有 in-process `local` mode，没有 RPC、进程监控、transport 版本协商或 Web/Core 独立故障恢复。
-- 每个请求一个有界队列，选择了隔离性而不是等待慢客户端；满队列会取消该请求。容量由
-  `output_queue_size` 控制，需要在内存占用和慢消费者容忍度之间权衡。
-- dispatcher metrics 仅存在进程内，尚未接入 Prometheus、日志或 trace；TTFT、ITL、E2EL 等性能指标
-  尚未采集。
-- `PlainTextPromptRenderer` 不是模型专用 chat template。真实 tokenizer 接入后应替换 renderer，
-  并明确 token ID、stop token 和多模态输入边界。
-- `request_timeout_s` 约束 Serve 层等待时间；真实 Core 必须确保 abort 能释放 scheduler 请求、执行资源和
-  KV cache。
-- 本地真实 Engine 接入后，一个 Uvicorn worker 会拥有一份模型；应限制为单 Web worker，避免重复加载
-  导致 GPU OOM。
+### 优点
+
+- API Server、`LLMEngine`、`EngineCoreClient` 与 `EngineCore` 职责清晰，OpenAI 协议不进入 Core。
+- 当前 in-process path 没有序列化、IPC、后台 dispatcher 或队列开销，便于验证 Core 正确性。
+- async generator 与 `StreamingResponse` 直接衔接，token 产生后可逐 chunk 发送。
+
+### 缺点 / 限制
+
+- `EngineCoreClient` 是同步 pull 接口；`get_output()` 在调用 Engine 的事件循环线程执行模型 step。
+  当前没有独立 Core worker、输出队列或跨请求 backpressure 隔离。
+- `LLMEngine` 通过共享 pending event map 路由一个 step 的输出，但没有专用 dispatcher task；多请求的
+  推进依赖各 HTTP generator 持续被调度。
+- 只有 `InprocClient`，每个 Uvicorn worker 都会加载一份 `NaiveHFExecutor`/模型；生产部署应限制 worker
+  数量以避免重复占用 GPU 内存。
+- scheduler 不包含 KV cache、prefix cache、优先级、抢占或指标；当前 `stop` string 也未实现。
+- 断连检查发生在事件之间；当单次 Core step 很慢时，取消要等该 step 返回才能生效。
+
+### Trade-offs
+
+当前选择同步 in-process pull transport，以较小的实现复杂度换取可直接验证的 Core/Executor 路径。
+当需要 Web 与 Engine 独立扩缩、避免阻塞 Web event loop 或实现更强的慢消费者隔离时，可保持
+`LLMEngineProtocol` 不变，将 `EngineCoreClient` 替换为带请求/响应队列的进程内线程、进程间或 RPC
+实现；该改动会需要明确输出所有权、背压、取消确认和故障恢复语义。
+
+## 7. 结构化配置
+
+### 7.1 背景与目标
+
+当前配置需要同时描述 HTTP 服务、模型、executor 和 scheduler。继续在 `ServeConfig` 中添加
+`hf_*` 字段会让职责边界变得模糊。本项目采用单一顶层配置 `XTokensConfig`，并按职责拆分子配置。
+
+```mermaid
+flowchart TD
+    User[CLI / Python API] --> X[XTokensConfig]
+    X --> M[ModelConfig]
+    X --> S[SchedulerConfig]
+    X --> E[ExecutorConfig]
+    X --> H[ServerConfig]
+    X --> R[Runtime factory]
+    R --> C[EngineCore]
+    R --> EX[Executor]
+    R --> SC[Scheduler]
+```
+
+### 7.2 配置结构
+
+所有配置使用 `dataclass(frozen=True, slots=True)`，由构造函数完成必要校验：
+
+```python
+@dataclass(frozen=True, slots=True)
+class XTokensConfig:
+    model_config: ModelConfig
+    scheduler_config: SchedulerConfig
+    executor_config: ExecutorConfig
+    server_config: ServerConfig
+```
+
+| 配置 | 职责 |
+| --- | --- |
+| `ModelConfig` | served model 名称、实际模型路径和 `max_model_len` |
+| `SchedulerConfig` | scheduler policy 和 `max_num_seqs` |
+| `ExecutorConfig` | executor backend、device、dtype 和本地模型加载选项 |
+| `ServerConfig` | HTTP、鉴权、超时、关闭策略和 CORS |
+
+`hf_model` 对应 `ModelConfig.model`，`hf_max_num_seqs` 对应
+`SchedulerConfig.max_num_seqs`，字段不再携带 backend 前缀。配置对象只保存可序列化数据，
+executor/scheduler 实例由 runtime factory 创建。
+
+### 7.3 构造与兼容迁移
+
+```mermaid
+sequenceDiagram
+    participant A as CLI / API
+    participant X as XTokensConfig
+    participant F as Runtime factory
+    participant E as Executor
+    participant S as Scheduler
+    participant C as EngineCore
+
+    A->>X: construct and validate
+    X-->>F: read sub-configs
+    F->>E: create from ExecutorConfig
+    F->>S: create from SchedulerConfig
+    F->>C: create Core with Executor and Scheduler
+```
+
+`ServeConfig` 暂时作为旧 flat API 保留，并通过 `to_xtokens_config()` 转换为新配置。
+新代码使用 `XTokensConfig`；Python 嵌入场景可继续通过 runtime factory 注入自定义实现。
+当前 registry 支持 `naive_hf` executor 和 `naive` scheduler，未知 backend/policy 在配置
+构造时直接报错。后续增加 KV cache、parallel 或 connector 配置时，只需增加对应子配置，
+不再扩展 Serve 顶层字段。
+
+### 7.4 配置测试
+
+- 子配置默认值和边界校验。
+- `XTokensConfig` 组合校验。
+- CLI 参数到子配置映射。
+- 默认 executor/scheduler 创建及自定义 factory 注入。
+- `ServeConfig.to_xtokens_config()` 兼容迁移。

@@ -7,8 +7,15 @@ import os
 
 import uvicorn
 
+from x_tokens.config import (
+    ExecutorConfig,
+    ModelConfig,
+    SchedulerConfig,
+    ServerConfig,
+    XTokensConfig,
+)
+
 from .app import create_app
-from .config import ServeConfig
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -35,27 +42,33 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
-    config = ServeConfig(
-        host=args.host,
-        port=args.port,
-        served_model_name=args.served_model_name,
-        hf_model=args.hf_model,
-        hf_device=args.hf_device,
-        hf_dtype=args.hf_dtype,
-        hf_local_files_only=args.hf_local_files_only,
-        hf_max_num_seqs=args.hf_max_num_seqs,
-        api_key=args.api_key,
-        request_timeout_s=args.request_timeout,
-        shutdown_timeout_s=args.shutdown_timeout,
-        shutdown_policy=args.shutdown_policy,
-        cors_origins=tuple(args.cors_origin),
-        access_log=not args.no_access_log,
+    config = XTokensConfig(
+        model_config=ModelConfig(
+            served_model_name=args.served_model_name,
+            model=args.hf_model,
+        ),
+        scheduler_config=SchedulerConfig(max_num_seqs=args.hf_max_num_seqs),
+        executor_config=ExecutorConfig(
+            device=args.hf_device,
+            dtype=args.hf_dtype,
+            local_files_only=args.hf_local_files_only,
+        ),
+        server_config=ServerConfig(
+            host=args.host,
+            port=args.port,
+            api_key=args.api_key,
+            request_timeout_s=args.request_timeout,
+            shutdown_timeout_s=args.shutdown_timeout,
+            shutdown_policy=args.shutdown_policy,
+            cors_origins=tuple(args.cors_origin),
+            access_log=not args.no_access_log,
+        ),
     )
     uvicorn.run(
         create_app(config),
-        host=config.host,
-        port=config.port,
-        access_log=config.access_log,
+        host=config.server_config.host,
+        port=config.server_config.port,
+        access_log=config.server_config.access_log,
     )
 
 

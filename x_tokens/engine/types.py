@@ -67,7 +67,6 @@ class CoreTokenEvent:
 
     request_id: str
     token_id: int
-    text: str
 
 
 @dataclass(frozen=True, slots=True)

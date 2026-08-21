@@ -10,10 +10,10 @@ from dataclasses import dataclass
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from x_tokens.config import ServerConfig
 from x_tokens.engine.llm_engine import LLMEngineProtocol
 from x_tokens.engine.types import EngineEvent, ErrorEvent
 
-from ..config import ServeConfig
 from ..errors import EngineRequestError, OpenAIError
 from ..generation import ChatCompletionService, GenerationService
 from ..models import ModelRegistry
@@ -36,7 +36,7 @@ router = APIRouter()
 
 @dataclass(slots=True)
 class ServeServices:
-    config: ServeConfig
+    config: ServerConfig
     engine: LLMEngineProtocol
     models: ModelRegistry
     completions: GenerationService
@@ -52,7 +52,7 @@ def _services(request: Request) -> ServeServices:
     return request.app.state.serve_services
 
 
-def _check_api_key(request: Request, config: ServeConfig) -> None:
+def _check_api_key(request: Request, config: ServerConfig) -> None:
     if config.api_key is None:
         return
     if request.headers.get("authorization") != f"Bearer {config.api_key}":

@@ -1,68 +1,64 @@
-"""Hugging Face executor for the naive, full-context decode loop."""
+"""Naive Hugging Face model executor for the synchronous EngineCore."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
 
-from ..core.scheduler import ScheduledRequest, SchedulingBatch
-from .base import Executor
+from ..core.scheduler import ScheduledRequest, SchedulerOutput
+from .base import Executor, ModelForwardOutput
 
 
 @dataclass(frozen=True, slots=True)
-class HFExecutorConfig:
-    """Hugging Face-specific model loading configuration."""
+class NaiveHFExecutorConfig:
+    """Hugging Face model loading settings for the no-KV-cache executor."""
 
     model: str
     device: str = "auto"
     dtype: str = "auto"
     local_files_only: bool = False
+    pad_token_id: int | None = None
+    eos_token_ids: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         if not self.model:
             raise ValueError("model must not be empty")
 
 
-class HFExecutor(Executor):
-    """Run one no-cache causal-LM forward pass for each scheduled sequence."""
+class NaiveHFExecutor(Executor):
+    """Run full-context, no-cache HF causal-LM forward passes for each step."""
 
     def __init__(
         self,
-        config: HFExecutorConfig,
+        config: NaiveHFExecutorConfig,
         *,
         model: Any | None = None,
-        tokenizer: Any | None = None,
         torch_module: Any | None = None,
     ) -> None:
         self.config = config
         self._torch = torch_module
-        if model is None or tokenizer is None:
-            self._torch, model, tokenizer = self._load_model(config)
+        if model is None:
+            self._torch, model = self._load_model(config)
         if self._torch is None:
             raise RuntimeError("torch_module is required with an injected model")
         self.model = model
-        self.tokenizer = tokenizer
-        if self.tokenizer.pad_token_id is None:
-            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        if self.tokenizer.pad_token_id is None:
-            raise ValueError("tokenizer must define pad_token_id or eos_token_id")
-        self._eos_token_ids = self._normalize_eos_token_ids(self.tokenizer.eos_token_id)
+        if config.pad_token_id is None:
+            raise ValueError("pad_token_id must be provided by the input processor")
+        self._pad_token_id = config.pad_token_id
+        self._eos_token_ids = config.eos_token_ids
         self._input_device = self._get_input_device()
 
     @staticmethod
-    def _load_model(config: HFExecutorConfig) -> tuple[Any, Any, Any]:
+    def _load_model(config: NaiveHFExecutorConfig) -> tuple[Any, Any]:
         try:
             import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from transformers import AutoModelForCausalLM
         except ImportError as error:
             raise RuntimeError(
-                "HF EngineCore requires x-tokens[hf] (torch and transformers)"
+                "NaiveHFExecutor requires x-tokens[hf] (torch and transformers)"
             ) from error
 
         dtype = None if config.dtype == "auto" else getattr(torch, config.dtype)
-        tokenizer = AutoTokenizer.from_pretrained(
-            config.model, local_files_only=config.local_files_only
-        )
         model_kwargs: dict[str, Any] = {
             "dtype": dtype,
             "local_files_only": config.local_files_only,
@@ -73,34 +69,19 @@ class HFExecutor(Executor):
         if config.device not in {"auto", "cpu"}:
             model.to(config.device)
         model.eval()
-        return torch, model, tokenizer
-
-    @staticmethod
-    def _normalize_eos_token_ids(value: int | list[int] | None) -> frozenset[int]:
-        if value is None:
-            return frozenset()
-        if isinstance(value, int):
-            return frozenset((value,))
-        return frozenset(value)
+        return torch, model
 
     @property
     def eos_token_ids(self) -> frozenset[int]:
         return self._eos_token_ids
 
-    def encode(self, prompt: str | tuple[int, ...]) -> tuple[int, ...]:
-        if isinstance(prompt, tuple):
-            return prompt
-        encoded = self.tokenizer(prompt, add_special_tokens=True)["input_ids"]
-        return tuple(int(token_id) for token_id in encoded)
-
-    def execute(self, batch: SchedulingBatch) -> tuple[int, ...]:
+    def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput:
         if not batch.requests:
-            return ()
+            return ModelForwardOutput(logits=None)
         contexts = [request.context_token_ids for request in batch.requests]
         max_length = max(len(context) for context in contexts)
-        pad_token_id = self.tokenizer.pad_token_id
         input_ids = [
-            [pad_token_id] * (max_length - len(context)) + list(context)
+            [self._pad_token_id] * (max_length - len(context)) + list(context)
             for context in contexts
         ]
         attention_mask = [
@@ -114,23 +95,20 @@ class HFExecutor(Executor):
         }
         with torch.inference_mode():
             logits = self.model(**inputs, use_cache=False).logits[:, -1, :]
+        return ModelForwardOutput(logits=logits)
+
+    def sample_tokens(
+        self, output: ModelForwardOutput, batch: SchedulerOutput
+    ) -> tuple[int, ...]:
+        if not batch.requests:
+            return ()
+        if output.logits is None:
+            raise ValueError("model output logits must not be None")
+        logits = output.logits
         return tuple(
             self._sample(logits[index], request)
             for index, request in enumerate(batch.requests)
         )
-
-    def decode_delta(self, request: ScheduledRequest) -> str:
-        decoded = self.tokenizer.decode(
-            request.output_token_ids, skip_special_tokens=True
-        )
-        if decoded.startswith(request.decoded_text):
-            delta = decoded[len(request.decoded_text) :]
-        else:
-            # Some tokenizers can rewrite whitespace while decoding. Returning the
-            # full new text is safer than dropping user-visible output.
-            delta = decoded
-        request.decoded_text = decoded
-        return delta
 
     def _get_input_device(self) -> Any:
         embeddings = self.model.get_input_embeddings()

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Protocol
 
 from ..engine.types import FinishReason, GenerateRequest
 
@@ -42,7 +43,7 @@ class ScheduledRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class SchedulingBatch:
+class SchedulerOutput:
     requests: tuple[ScheduledRequest, ...]
 
 
@@ -53,7 +54,34 @@ class SchedulerUpdate:
     finish_reason: FinishReason | None
 
 
-class NaiveScheduler:
+class Scheduler(Protocol):
+    """Scheduling contract consumed by ``EngineCore``."""
+
+    @property
+    def has_work(self) -> bool: ...
+
+    def add_request(
+        self, request: GenerateRequest, prompt_token_ids: tuple[int, ...]
+    ) -> None: ...
+
+    def schedule(self) -> SchedulerOutput: ...
+
+    def update_from_output(
+        self,
+        batch: SchedulerOutput,
+        token_ids: tuple[int, ...],
+        *,
+        eos_token_ids: frozenset[int],
+    ) -> tuple[SchedulerUpdate, ...]: ...
+
+    def fail_batch(self, batch: SchedulerOutput) -> tuple[ScheduledRequest, ...]: ...
+
+    def abort(self, request_id: str) -> bool: ...
+
+    def abort_all(self) -> tuple[ScheduledRequest, ...]: ...
+
+
+class NaiveScheduler(Scheduler):
     """Admit requests in FIFO order and execute every running request per step."""
 
     def __init__(self, *, max_num_seqs: int, max_model_len: int) -> None:
@@ -93,16 +121,16 @@ class NaiveScheduler:
                 return True
         return False
 
-    def schedule(self) -> SchedulingBatch:
+    def schedule(self) -> SchedulerOutput:
         while self.waiting and len(self.running) < self._max_num_seqs:
             request = self.waiting.popleft()
             request.status = RequestStatus.RUNNING
             self.running[request.request_id] = request
-        return SchedulingBatch(tuple(self.running.values()))
+        return SchedulerOutput(tuple(self.running.values()))
 
     def update_from_output(
         self,
-        batch: SchedulingBatch,
+        batch: SchedulerOutput,
         token_ids: tuple[int, ...],
         *,
         eos_token_ids: frozenset[int],
@@ -129,7 +157,7 @@ class NaiveScheduler:
             updates.append(SchedulerUpdate(request, token_id, finish_reason))
         return tuple(updates)
 
-    def fail_batch(self, batch: SchedulingBatch) -> tuple[ScheduledRequest, ...]:
+    def fail_batch(self, batch: SchedulerOutput) -> tuple[ScheduledRequest, ...]:
         failed: list[ScheduledRequest] = []
         for request in batch.requests:
             if self.running.get(request.request_id) is request:

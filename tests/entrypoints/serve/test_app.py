@@ -5,7 +5,9 @@ from collections.abc import AsyncIterator
 
 from fastapi.testclient import TestClient
 
-from x_tokens.core.scheduler import ScheduledRequest, SchedulingBatch
+from x_tokens.core.scheduler import SchedulerOutput
+from x_tokens.engine.input_processor import InputProcessor
+from x_tokens.engine.output_processor import OutputProcessor
 from x_tokens.engine.types import (
     EngineEvent,
     EngineHealth,
@@ -20,7 +22,7 @@ from x_tokens.entrypoints.serve import ServeConfig, create_app
 from x_tokens.entrypoints.serve import app as serve_app
 from x_tokens.entrypoints.serve.generation import GenerationService
 from x_tokens.entrypoints.serve.models import ModelRegistry
-from x_tokens.executor.base import Executor
+from x_tokens.executor.base import Executor, ModelForwardOutput
 
 
 class FakeEngine:
@@ -57,16 +59,37 @@ class FakeEngine:
 class FakeExecutor(Executor):
     eos_token_ids = frozenset((9,))
 
-    def encode(self, prompt: str | tuple[int, ...]) -> tuple[int, ...]:
-        del prompt
-        return (1,)
+    def execute_model(self, batch: SchedulerOutput) -> ModelForwardOutput:
+        return ModelForwardOutput(None)
 
-    def execute(self, batch: SchedulingBatch) -> tuple[int, ...]:
+    def sample_tokens(
+        self, output: ModelForwardOutput, batch: SchedulerOutput
+    ) -> tuple[int, ...]:
+        del output
         return tuple(9 for _ in batch.requests)
 
-    def decode_delta(self, request: ScheduledRequest) -> str:
-        del request
+
+class FakeInputProcessor(InputProcessor):
+    pad_token_id = 0
+    eos_token_ids = frozenset((9,))
+
+    def process(self, request: GenerateRequest) -> GenerateRequest:
+        return GenerateRequest(
+            request.request_id, request.model, (1,), request.sampling
+        )
+
+    @property
+    def tokenizer(self) -> object:
+        return object()
+
+
+class FakeOutputProcessor(OutputProcessor):
+    def process_token(self, request_id: str, token_id: int) -> str:
+        del request_id, token_id
         return ""
+
+    def finish(self, request_id: str) -> None:
+        del request_id
 
 
 def client_for(engine: FakeEngine, **config: object) -> TestClient:
@@ -150,7 +173,17 @@ def test_unfinished_event_stream_aborts_request() -> None:
 
 
 def test_default_factory_uses_inproc_llm_engine(monkeypatch) -> None:
-    monkeypatch.setattr(serve_app, "HFExecutor", lambda _: FakeExecutor())
+    monkeypatch.setattr(
+        serve_app.TokenizerInputProcessor,
+        "from_config",
+        lambda *args, **kwargs: FakeInputProcessor(),
+    )
+    monkeypatch.setattr(serve_app, "NaiveHFExecutor", lambda _: FakeExecutor())
+    monkeypatch.setattr(
+        serve_app,
+        "TokenizerOutputProcessor",
+        lambda _: FakeOutputProcessor(),
+    )
     app = create_app(ServeConfig(served_model_name="test-model"))
 
     with TestClient(app) as client:

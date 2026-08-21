@@ -1,6 +1,6 @@
 """Model execution backends."""
 
-from .base import Executor
-from .hf import HFExecutor, HFExecutorConfig
+from .base import Executor, ModelForwardOutput
+from .naive_hf_executor import NaiveHFExecutor, NaiveHFExecutorConfig
 
-__all__ = ["Executor", "HFExecutor", "HFExecutorConfig"]
+__all__ = ["Executor", "ModelForwardOutput", "NaiveHFExecutor", "NaiveHFExecutorConfig"]

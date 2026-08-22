@@ -85,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--top-p", type=float)
     parser.add_argument("--top-k", type=int)
     parser.add_argument("--logprobs", type=int)
+    parser.add_argument(
+        "--ignore-eos",
+        action="store_true",
+        help="ignore EOS and generate until the requested output length",
+    )
     parser.add_argument("--extra-body", type=_json_object)
     parser.add_argument("--header", action="append", default=[], metavar="NAME=VALUE")
     parser.add_argument("--percentiles", default="50,90,99")
@@ -117,6 +122,13 @@ def _limits(values: list[str]) -> dict[str, float]:
         except ValueError as exc:
             raise ValueError(f"invalid goodput limit '{value}'") from exc
     return result
+
+
+def _extra_body(args: argparse.Namespace) -> dict[str, Any] | None:
+    extra_body = dict(args.extra_body or {})
+    if args.ignore_eos:
+        extra_body["ignore_eos"] = True
+    return extra_body or None
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -161,7 +173,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             top_k=args.top_k,
             logprobs=args.logprobs,
             extra_headers=_headers(args.header),
-            extra_body=args.extra_body,
+            extra_body=_extra_body(args),
             num_warmups=args.num_warmups,
             timeout_s=args.ready_timeout,
             ready_check=not args.no_ready_check,

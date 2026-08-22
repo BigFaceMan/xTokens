@@ -93,7 +93,8 @@ class EngineCore:
         )
         for scheduler_update in scheduler_updates:
             request = scheduler_update.request
-            if scheduler_update.token_id not in self._executor.eos_token_ids:
+            is_eos = scheduler_update.token_id in self._executor.eos_token_ids
+            if not is_eos or request.request.sampling.ignore_eos:
                 outputs.add(
                     CoreTokenEvent(
                         request.request_id,

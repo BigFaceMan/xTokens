@@ -4,9 +4,17 @@ from x_tokens.core.scheduler import NaiveScheduler, RequestStatus
 from x_tokens.engine.types import FinishReason, GenerateRequest, SamplingParams
 
 
-def request(request_id: str, *, max_tokens: int = 2) -> GenerateRequest:
+def request(
+    request_id: str,
+    *,
+    max_tokens: int = 2,
+    ignore_eos: bool = False,
+) -> GenerateRequest:
     return GenerateRequest(
-        request_id, "test-model", "prompt", SamplingParams(max_tokens)
+        request_id,
+        "test-model",
+        "prompt",
+        SamplingParams(max_tokens=max_tokens, ignore_eos=ignore_eos),
     )
 
 
@@ -41,6 +49,32 @@ def test_scheduler_finishes_on_eos_and_length() -> None:
 
     assert updates[0].finish_reason is FinishReason.STOP
     assert updates[1].finish_reason is FinishReason.LENGTH
+    assert not scheduler.has_work
+
+
+def test_scheduler_applies_ignore_eos_per_request_until_max_tokens() -> None:
+    scheduler = NaiveScheduler(max_num_seqs=2, max_model_len=8)
+    scheduler.add_request(request("stop", max_tokens=2), (1,))
+    scheduler.add_request(
+        request("ignore", max_tokens=2, ignore_eos=True),
+        (1,),
+    )
+
+    first = scheduler.update_from_output(
+        scheduler.schedule(),
+        (9, 9),
+        eos_token_ids=frozenset((9,)),
+    )
+    second = scheduler.update_from_output(
+        scheduler.schedule(),
+        (9,),
+        eos_token_ids=frozenset((9,)),
+    )
+
+    assert first[0].finish_reason is FinishReason.STOP
+    assert first[1].finish_reason is None
+    assert second[0].finish_reason is FinishReason.LENGTH
+    assert second[0].request.output_token_ids == [9, 9]
     assert not scheduler.has_work
 
 

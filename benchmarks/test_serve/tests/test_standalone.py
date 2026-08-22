@@ -11,6 +11,10 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
 
+from ..cli.main import (  # pyright: ignore[reportMissingImports]
+    _extra_body,
+    build_parser,
+)
 from ..dataset.datasets import load_samples  # pyright: ignore[reportMissingImports]
 from ..dataset.tokenizer import BasicTokenizer  # pyright: ignore[reportMissingImports]
 from ..lib.metrics import calculate_metrics  # pyright: ignore[reportMissingImports]
@@ -58,6 +62,20 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class StandaloneBenchmarkTest(unittest.TestCase):
+    def test_ignore_eos_cli_merges_with_extra_body(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--ignore-eos",
+                "--extra-body",
+                '{"custom": 1, "ignore_eos": false}',
+            ]
+        )
+
+        self.assertEqual(
+            _extra_body(args),
+            {"custom": 1, "ignore_eos": True},
+        )
+
     def test_random_dataset_and_metrics(self) -> None:
         samples = load_samples("random", 2, 3, 2, BasicTokenizer())
         self.assertEqual([sample.prompt_len for sample in samples], [3, 3])

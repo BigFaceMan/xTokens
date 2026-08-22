@@ -53,7 +53,7 @@ Serve 层的 `default_engine_factory` 同样接受可选的 `executor_factory` �
 3. `step_fn()` 先取出暂存事件，再由 `Scheduler.schedule()` 将请求填入 running batch；默认实现以 FIFO 纳入请求，上限为 `max_num_seqs`。
 4. Core 调用 `Executor.execute_model(SchedulerOutput)` 获取 `ModelForwardOutput`。
 5. Core 将 forward 输出交给 `Executor.sample_tokens(output, SchedulerOutput)`，每个 running request 得到一个 token ID。
-6. Scheduler 追加 token 并依据 EOS、`max_tokens` 或 `max_model_len` 计算完成状态。非 EOS token 产生 `CoreTokenEvent`；完成请求额外产生 `CoreFinishedEvent`。
+6. Scheduler 追加 token 并依据请求级 `ignore_eos`、EOS、`max_tokens` 或 `max_model_len` 计算完成状态。普通请求的 EOS 产生 `STOP` 且不发送 token event；ignore-EOS 请求把 EOS 作为普通 `CoreTokenEvent`，继续生成到长度限制。完成请求额外产生 `CoreFinishedEvent`。
 7. forward 或采样失败时 Core 调用 `fail_batch()`，向仍在该 batch 中的请求分别产生 `CoreErrorEvent`。
 
 ```mermaid
@@ -130,7 +130,9 @@ stateDiagram-v2
     [*] --> Waiting: add_request
     Waiting --> Running: schedule
     Running --> Running: non-terminal token
-    Running --> Finished: EOS / length
+    Running --> Running: EOS and ignore_eos=true
+    Running --> Finished: EOS and ignore_eos=false
+    Running --> Finished: max_tokens / max_model_len
     Waiting --> Aborted: abort_requests
     Running --> Aborted: abort_requests
     Running --> Failed: executor error

@@ -19,6 +19,7 @@ class CompletionRequest(BaseModel):
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=1)
     stop: str | list[str] | None = None
+    ignore_eos: bool = False
     stream: bool = False
     stream_options: StreamOptions | None = None
 
@@ -37,6 +38,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=1)
     stop: str | list[str] | None = None
+    ignore_eos: bool = False
     stream: bool = False
     stream_options: StreamOptions | None = None
 

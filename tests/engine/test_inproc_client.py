@@ -11,6 +11,7 @@ from x_tokens.engine.output_processor import OutputProcessor
 from x_tokens.engine.types import (
     CoreFinishedEvent,
     FinishedEvent,
+    FinishReason,
     GenerateRequest,
     SamplingParams,
     TokenEvent,
@@ -93,6 +94,29 @@ def test_llm_engine_normalizes_direct_inproc_outputs() -> None:
         events = [event async for event in engine.generate(request)]
         assert not any(isinstance(event, TokenEvent) for event in events)
         assert isinstance(events[-1], FinishedEvent)
+        await engine.close()
+
+    asyncio.run(scenario())
+
+
+def test_llm_engine_ignores_eos_until_max_tokens() -> None:
+    async def scenario() -> None:
+        engine = LLMEngine(
+            InprocClient(EngineCoreConfig(("test-model",)), FakeExecutor),
+            FakeInputProcessor(),
+            FakeOutputProcessor(),
+        )
+        request = GenerateRequest(
+            "eval",
+            "test-model",
+            "hello",
+            SamplingParams(max_tokens=2, ignore_eos=True),
+        )
+
+        events = [event async for event in engine.generate(request)]
+
+        assert events[:2] == [TokenEvent("eval", 9, ""), TokenEvent("eval", 9, "")]
+        assert events[-1] == FinishedEvent("eval", FinishReason.LENGTH, 1, 2)
         await engine.close()
 
     asyncio.run(scenario())

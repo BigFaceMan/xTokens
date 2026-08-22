@@ -22,6 +22,7 @@ class SamplingParams:
     top_p: float = 1.0
     top_k: int | None = None
     stop: tuple[str, ...] = ()
+    ignore_eos: bool = False
 
 
 @dataclass(frozen=True, slots=True)

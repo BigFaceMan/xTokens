@@ -105,7 +105,11 @@ def test_completion_uses_client_request_id_and_openai_error_format() -> None:
         response = client.post(
             "/v1/completions",
             headers={"X-Request-ID": "benchmark-1"},
-            json={"model": "test-model", "prompt": "hello"},
+            json={
+                "model": "test-model",
+                "prompt": "hello",
+                "ignore_eos": True,
+            },
         )
         assert response.status_code == 200
         assert response.json()["id"] == "benchmark-1"
@@ -115,6 +119,7 @@ def test_completion_uses_client_request_id_and_openai_error_format() -> None:
             "completion_tokens": 2,
             "total_tokens": 5,
         }
+        assert engine.calls[0].sampling.ignore_eos is True
 
         invalid = client.post(
             "/v1/completions",
@@ -148,6 +153,7 @@ def test_chat_stream_includes_usage_and_late_error() -> None:
             json={
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "hello"}],
+                "ignore_eos": True,
                 "stream": True,
                 "stream_options": {"include_usage": True},
             },
@@ -156,6 +162,7 @@ def test_chat_stream_includes_usage_and_late_error() -> None:
         assert '"content":"Hello"' in response.text
         assert '"message":"mock failure"' in response.text
         assert response.text.endswith("data: [DONE]\n\n")
+        assert engine.calls[0].sampling.ignore_eos is True
 
 
 def test_unfinished_event_stream_aborts_request() -> None:
@@ -194,3 +201,33 @@ def test_default_factory_uses_inproc_llm_engine(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["choices"][0]["finish_reason"] == "stop"
+
+
+def test_default_factory_ignores_eos_until_max_tokens(monkeypatch) -> None:
+    monkeypatch.setattr(
+        serve_app.TokenizerInputProcessor,
+        "from_config",
+        lambda *args, **kwargs: FakeInputProcessor(),
+    )
+    monkeypatch.setattr(serve_app, "NaiveHFExecutor", lambda _: FakeExecutor())
+    monkeypatch.setattr(
+        serve_app,
+        "TokenizerOutputProcessor",
+        lambda _: FakeOutputProcessor(),
+    )
+    app = create_app(ServeConfig(served_model_name="test-model"))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "hello",
+                "max_tokens": 2,
+                "ignore_eos": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["finish_reason"] == "length"
+    assert response.json()["usage"]["completion_tokens"] == 2

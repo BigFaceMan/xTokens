@@ -31,8 +31,18 @@ class FakeExecutor(Executor):
         return tuple(next(self._token_ids) for _ in batch.requests)
 
 
-def request(request_id: str, *, model: str = "test-model") -> GenerateRequest:
-    return GenerateRequest(request_id, model, (1,), SamplingParams(max_tokens=2))
+def request(
+    request_id: str,
+    *,
+    model: str = "test-model",
+    ignore_eos: bool = False,
+) -> GenerateRequest:
+    return GenerateRequest(
+        request_id,
+        model,
+        (1,),
+        SamplingParams(max_tokens=2, ignore_eos=ignore_eos),
+    )
 
 
 def test_core_steps_batches_and_returns_events_directly() -> None:
@@ -57,6 +67,23 @@ def test_core_steps_batches_and_returns_events_directly() -> None:
         CoreFinishedEvent("one", FinishReason.STOP, 1, 2),
         CoreTokenEvent("two", 4),
         CoreFinishedEvent("two", FinishReason.LENGTH, 1, 2),
+    )
+
+
+def test_core_emits_ignored_eos_until_request_length() -> None:
+    core = EngineCore(
+        EngineCoreConfig(("test-model",)),
+        executor=FakeExecutor([9, 9]),
+    )
+    core.add_request(request("eval", ignore_eos=True))
+
+    first, _ = core.step_fn()
+    second, _ = core.step_fn()
+
+    assert first.get(0) == (CoreTokenEvent("eval", 9),)
+    assert second.get(0) == (
+        CoreTokenEvent("eval", 9),
+        CoreFinishedEvent("eval", FinishReason.LENGTH, 1, 2),
     )
 
 

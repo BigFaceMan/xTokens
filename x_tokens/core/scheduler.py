@@ -143,7 +143,7 @@ class NaiveScheduler(Scheduler):
                 continue
             request.output_token_ids.append(token_id)
             finish_reason: FinishReason | None = None
-            if token_id in eos_token_ids:
+            if token_id in eos_token_ids and not request.request.sampling.ignore_eos:
                 finish_reason = FinishReason.STOP
             elif (
                 request.completion_tokens >= request.request.sampling.max_tokens

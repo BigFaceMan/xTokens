@@ -43,6 +43,7 @@ def sampling_from_request(
         top_p=request.top_p,
         top_k=request.top_k,
         stop=_stop_values(request.stop),
+        ignore_eos=request.ignore_eos,
     )
 
 

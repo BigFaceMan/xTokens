@@ -89,7 +89,7 @@ class NaiveHFExecutor(Executor):
 
 `execute_model` 只负责输入构造和模型 forward，不执行采样；`sample_tokens`
 消费同一 batch 顺序的 `ModelForwardOutput.logits`。这样 Core 可以独立处理
-forward/采样异常，scheduler 仍负责 EOS 和长度终止判断。
+forward/采样异常，scheduler 仍负责请求级 `ignore_eos`、EOS 和长度终止判断。
 ```
 
 `pad_token_id` 必须由 Engine 的 input processor 提供；缺失时构造 executor 失败。`device="auto"` 使用 HF `device_map="auto"`，非 CPU 的显式 device 则在加载后调用 `model.to(device)`。

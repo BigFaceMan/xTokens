@@ -285,6 +285,7 @@ python -m test_serve \
 | `--no-ready-check` | 跳过 readiness check |
 | `--no-progress` | 关闭按已完成请求数更新的终端进度条 |
 | `--extra-body` | JSON 对象形式的额外请求字段 |
+| `--ignore-eos` | 忽略模型 EOS，按请求输出长度生成，适用于固定长度 eval |
 | `--header` | `NAME=VALUE`，可重复传入 |
 | `--percentiles` | 如 `50,90,99` |
 | `--goodput` | 如 `ttft=200` 或 `e2el=1000`，单位 ms |

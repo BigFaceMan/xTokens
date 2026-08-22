@@ -216,7 +216,9 @@ EngineEvent = TokenEvent | FinishedEvent | ErrorEvent
 CoreEvent = CoreTokenEvent | CoreFinishedEvent | CoreErrorEvent
 ```
 
-`SamplingParams` 当前包含 `max_tokens`、`temperature`、`top_p`、`top_k` 和 `stop`。`InputProcessor`
+`SamplingParams` 当前包含 `max_tokens`、`temperature`、`top_p`、`top_k`、`stop` 和
+`ignore_eos`。Completion 与 Chat Completion API 都接受 `ignore_eos`，默认值为 false；开启时
+Core 将 EOS 作为普通 token 继续生成，直到 `max_tokens` 或 `max_model_len`。`InputProcessor`
 与 Core 都会校验输入；当前不支持 stop string，传入时会产生请求级错误。`FinishedEvent`
 携带 prompt/completion token 数和 `FinishReason`，adapter 据此生成 OpenAI usage。
 

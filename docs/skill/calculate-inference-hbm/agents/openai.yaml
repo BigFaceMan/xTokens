@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inference HBM Calculator"
+  short_description: "Profile per-GPU HBM and concurrency limits"
+  default_prompt: "Use $calculate-inference-hbm to profile or estimate the per-GPU HBM breakdown and active-sequence limits for this deployment."

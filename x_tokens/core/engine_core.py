@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass, field
 
 from ..engine.types import (
@@ -13,8 +15,11 @@ from ..engine.types import (
     GenerateRequest,
 )
 from ..executor.base import Executor
+from ..logger import init_logger
 from .config import EngineCoreConfig
 from .scheduler import NaiveScheduler, ScheduledRequest, Scheduler
+
+logger = init_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -65,6 +70,11 @@ class EngineCore:
             self._validate_request(request)
             self._scheduler.add_request(request, request.prompt)
         except Exception as error:  # noqa: BLE001 - duplicate requests are isolated.
+            logger.warning(
+                "engine request rejected: request_id=%s error=%s",
+                request.request_id,
+                error,
+            )
             self._pending_outputs.add(CoreErrorEvent(request.request_id, str(error)))
 
     def abort_requests(self, request_ids: tuple[str, ...]) -> None:
@@ -79,13 +89,27 @@ class EngineCore:
         scheduler_output = self._scheduler.schedule()
         if not scheduler_output.requests:
             return outputs, False
+        debug_enabled = logger.isEnabledFor(logging.DEBUG)
+        step_started = time.perf_counter() if debug_enabled else 0.0
         try:
             model_output = self._executor.execute_model(scheduler_output)
             token_ids = self._executor.sample_tokens(model_output, scheduler_output)
-        except Exception as error:  # noqa: BLE001 - execution failure affects output.
+        except Exception as error:
+            logger.exception(
+                "model step failed: batch_size=%d request_ids=%s",
+                len(scheduler_output.requests),
+                tuple(request.request_id for request in scheduler_output.requests),
+            )
             for request in self._scheduler.fail_batch(scheduler_output):
                 outputs.add(CoreErrorEvent(request.request_id, str(error)))
             return outputs, True
+        if debug_enabled:
+            logger.debug(
+                "model step finished: batch_size=%d duration_ms=%.2f request_ids=%s",
+                len(scheduler_output.requests),
+                (time.perf_counter() - step_started) * 1000,
+                tuple(request.request_id for request in scheduler_output.requests),
+            )
         scheduler_updates = self._scheduler.update_from_output(
             scheduler_output,
             token_ids,
@@ -114,6 +138,7 @@ class EngineCore:
     def close(self) -> None:
         self._closed = True
         self._scheduler.abort_all()
+        logger.info("engine core closed")
 
     def _validate_request(self, request: GenerateRequest) -> None:
         if not self._config.accepts_model(request.model):

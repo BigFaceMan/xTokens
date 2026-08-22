@@ -22,6 +22,7 @@ from x_tokens.executor.naive_hf_executor import (
     NaiveHFExecutor,
     NaiveHFExecutorConfig,
 )
+from x_tokens.logger import init_logger
 
 from .config import ServeConfig
 from .errors import OpenAIError
@@ -32,6 +33,7 @@ from .renderer import PlainTextPromptRenderer
 
 EngineFactory = Callable[[XTokensConfig], LLMEngineProtocol]
 ExecutorFactory = Callable[[NaiveHFExecutorConfig], Executor]
+logger = init_logger(__name__)
 
 
 def _default_executor_factory(config: NaiveHFExecutorConfig) -> NaiveHFExecutor:
@@ -129,7 +131,19 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        engine = engine_factory(config)
+        logger.info(
+            "serve engine initializing: served_model=%s model=%s "
+            "max_model_len=%d max_num_seqs=%d",
+            config.model_config.served_model_name,
+            config.model_config.model_name,
+            config.model_config.max_model_len,
+            config.scheduler_config.max_num_seqs,
+        )
+        try:
+            engine = engine_factory(config)
+        except Exception:
+            logger.exception("serve engine initialization failed")
+            raise
         models = ModelRegistry(config.model_config.served_model_name)
         completions = GenerationService(
             engine,
@@ -147,11 +161,16 @@ def create_app(
         app.state.serve_services = ServeServices(
             server_config, engine, models, completions, chat
         )
-        await completions.refresh_readiness()
+        ready = await completions.refresh_readiness()
+        logger.info("serve engine ready: ready=%s", ready)
         try:
             yield
         finally:
-            await app.state.serve_services.close()
+            logger.info("serve engine shutting down")
+            try:
+                await app.state.serve_services.close()
+            finally:
+                logger.info("serve engine stopped")
 
     app = FastAPI(title="xTokens Serve API", lifespan=lifespan)
     app.add_middleware(

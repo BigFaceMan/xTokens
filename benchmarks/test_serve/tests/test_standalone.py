@@ -11,7 +11,9 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
 
+from .. import serve as serve_module  # pyright: ignore[reportMissingImports]
 from ..cli.main import (  # pyright: ignore[reportMissingImports]
+    _configure_logging,
     _extra_body,
     build_parser,
 )
@@ -62,6 +64,17 @@ class _Handler(BaseHTTPRequestHandler):
 
 
 class StandaloneBenchmarkTest(unittest.TestCase):
+    def test_cli_configures_standard_logging(self) -> None:
+        with patch("logging.basicConfig") as basic_config:
+            _configure_logging("DEBUG")
+
+        basic_config.assert_called_once_with(
+            level="DEBUG",
+            format="%(levelname)s %(asctime)s [%(name)s] %(message)s",
+            datefmt="%m-%d %H:%M:%S",
+            force=True,
+        )
+
     def test_ignore_eos_cli_merges_with_extra_body(self) -> None:
         args = build_parser().parse_args(
             [
@@ -157,18 +170,33 @@ class StandaloneBenchmarkTest(unittest.TestCase):
         thread.start()
         try:
             samples = [SampleRequest("say hi", 2, 2, request_id="case-0")]
-            result = asyncio.run(
-                benchmark(
-                    samples,
-                    backend="openai-chat",
-                    base_url=f"http://127.0.0.1:{server.server_port}",
-                    model=None,
-                    ready_check=True,
-                    timeout_s=5,
+            with self.assertLogs(serve_module.logger, level="INFO") as captured:
+                result = asyncio.run(
+                    benchmark(
+                        samples,
+                        backend="openai-chat",
+                        base_url=f"http://127.0.0.1:{server.server_port}",
+                        model=None,
+                        ready_check=True,
+                        num_warmups=1,
+                        timeout_s=5,
+                    )
                 )
-            )
             self.assertEqual(result["completed"], 1)
             self.assertEqual(result["total_output_tokens"], 2)
+            logs = "\n".join(captured.output)
+            self.assertIn(
+                "measured_requests=1 warmup_requests=1",
+                logs,
+            )
+            self.assertIn(
+                "warmup requests finished: sent=1 succeeded=1 failed=0",
+                logs,
+            )
+            self.assertIn(
+                "benchmark task finished: sent_requests=1 succeeded=1 failed=0",
+                logs,
+            )
         finally:
             server.shutdown()
             server.server_close()

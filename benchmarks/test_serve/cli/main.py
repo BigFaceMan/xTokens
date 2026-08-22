@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import math
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--goodput", action="append", default=[], metavar="METRIC=MS")
     parser.add_argument("--save-result", type=Path)
     parser.add_argument("--save-requests", type=Path)
+    parser.add_argument(
+        "--log-level",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+        default="INFO",
+    )
     return parser
 
 
@@ -129,6 +135,15 @@ def _extra_body(args: argparse.Namespace) -> dict[str, Any] | None:
     if args.ignore_eos:
         extra_body["ignore_eos"] = True
     return extra_body or None
+
+
+def _configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s %(asctime)s [%(name)s] %(message)s",
+        datefmt="%m-%d %H:%M:%S",
+        force=True,
+    )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -199,4 +214,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main() -> None:
-    run(build_parser().parse_args())
+    args = build_parser().parse_args()
+    _configure_logging(args.log_level)
+    run(args)

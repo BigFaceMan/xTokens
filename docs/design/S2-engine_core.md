@@ -55,6 +55,7 @@ Serve 层的 `default_engine_factory` 同样接受可选的 `executor_factory` �
 5. Core 将 forward 输出交给 `Executor.sample_tokens(output, SchedulerOutput)`，每个 running request 得到一个 token ID。
 6. Scheduler 追加 token 并依据请求级 `ignore_eos`、EOS、`max_tokens` 或 `max_model_len` 计算完成状态。普通请求的 EOS 产生 `STOP` 且不发送 token event；ignore-EOS 请求把 EOS 作为普通 `CoreTokenEvent`，继续生成到长度限制。完成请求额外产生 `CoreFinishedEvent`。
 7. forward 或采样失败时 Core 调用 `fail_batch()`，向仍在该 batch 中的请求分别产生 `CoreErrorEvent`。
+8. 每次 `schedule()` 在 DEBUG 级别记录 batch size、waiting/running 数量、admitted 数量和 request IDs；Core 在 DEBUG 级别记录模型 step 耗时。executor 或采样异常记录带 traceback 的 ERROR 日志。
 
 ```mermaid
 sequenceDiagram
@@ -153,6 +154,7 @@ the default `NaiveScheduler`; custom schedulers can be injected through `EngineC
 - `tests/engine/test_scheduler.py` 验证 FIFO、并发上限、完成与取消。
 - `tests/engine/test_hf_core.py` 用 `FakeExecutor` 验证 token-ID 边界、batch event 顺序、错误隔离和文本 prompt 拒绝。
 - `tests/engine/test_inproc_client.py` 验证 `InprocClient` 在调用线程推进 Core。
+- Scheduler 和 Core 日志测试验证每次调度状态、step 耗时及 batch 异常事件。
 
 ```bash
 uv run ruff check x_tokens tests

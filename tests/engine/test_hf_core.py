@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import logging
+from unittest.mock import Mock
+
 from x_tokens.core import EngineCore, EngineCoreConfig
+from x_tokens.core import engine_core as engine_core_module
 from x_tokens.core.scheduler import NaiveScheduler, SchedulerOutput
 from x_tokens.engine.types import (
     CoreErrorEvent,
@@ -68,6 +72,26 @@ def test_core_steps_batches_and_returns_events_directly() -> None:
         CoreTokenEvent("two", 4),
         CoreFinishedEvent("two", FinishReason.LENGTH, 1, 2),
     )
+
+
+def test_core_logs_model_step_timing(monkeypatch) -> None:
+    debug = Mock()
+    monkeypatch.setattr(
+        engine_core_module.logger,
+        "isEnabledFor",
+        lambda level: level == logging.DEBUG,
+    )
+    monkeypatch.setattr(engine_core_module.logger, "debug", debug)
+    core = EngineCore(
+        EngineCoreConfig(("test-model",)),
+        executor=FakeExecutor([2]),
+    )
+    core.add_request(request("timed"))
+
+    core.step_fn()
+
+    debug.assert_called_once()
+    assert debug.call_args.args[0].startswith("model step finished:")
 
 
 def test_core_emits_ignored_eos_until_request_length() -> None:

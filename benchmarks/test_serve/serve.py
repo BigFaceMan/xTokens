@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import random
 import time
@@ -18,6 +19,8 @@ from .lib.models import (  # pyright: ignore[reportMissingImports]
     RequestFuncOutput,
     SampleRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def get_request(
@@ -72,7 +75,7 @@ def _service_base(base_url: str) -> str:
     ):
         if normalized.endswith(suffix):
             return normalized[: -len(suffix)]
-    return normalized[:-3] if normalized.endswith("/v1") else normalized
+    return normalized.removesuffix("/v1")
 
 
 async def get_first_model(base_url: str, session: aiohttp.ClientSession) -> str:
@@ -177,6 +180,19 @@ async def benchmark(
     suffix, request_func = BACKENDS[backend]
     normalized_base = _service_base(base_url)
     api_url = normalized_base + suffix
+    rate_label = "unlimited" if request_rate == math.inf else f"{request_rate:g}"
+    concurrency_label = max_concurrency if max_concurrency is not None else "unlimited"
+    logger.info(
+        "benchmark task preparing: measured_requests=%d warmup_requests=%d "
+        "backend=%s endpoint=%s model=%s request_rate=%s max_concurrency=%s",
+        len(samples),
+        num_warmups,
+        backend,
+        api_url,
+        served_model_name or model or "auto",
+        rate_label,
+        concurrency_label,
+    )
     connector = aiohttp.TCPConnector(
         limit=max_concurrency or 0, limit_per_host=max_concurrency or 0
     )
@@ -186,6 +202,7 @@ async def benchmark(
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         if model is None:
             model = await get_first_model(base_url, session)
+        logger.info("benchmark target selected: model=%s", served_model_name or model)
 
         def make_input(sample: SampleRequest) -> RequestFuncInput:
             return RequestFuncInput(
@@ -212,17 +229,47 @@ async def benchmark(
             )
             if not ready.success:
                 raise RuntimeError(f"endpoint readiness check failed: {ready.error}")
+            logger.info("benchmark readiness check passed")
 
         semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
+        measured_sent = 0
 
-        async def send(sample: SampleRequest) -> RequestFuncOutput:
+        async def send(
+            sample: SampleRequest,
+            *,
+            measured: bool,
+        ) -> RequestFuncOutput:
+            async def dispatch() -> RequestFuncOutput:
+                nonlocal measured_sent
+                if measured:
+                    measured_sent += 1
+                logger.debug(
+                    "sending request: phase=%s request_id=%s input_tokens=%d "
+                    "output_tokens=%d",
+                    "measured" if measured else "warmup",
+                    sample.request_id,
+                    sample.prompt_len,
+                    sample.expected_output_len,
+                )
+                return await request_func(make_input(sample), session)
+
             if semaphore is None:
-                return await request_func(make_input(sample), session)
+                return await dispatch()
             async with semaphore:
-                return await request_func(make_input(sample), session)
+                return await dispatch()
 
         if num_warmups:
-            await asyncio.gather(*(send(samples[0]) for _ in range(num_warmups)))
+            logger.info("sending warmup requests: count=%d", num_warmups)
+            warmup_outputs = await asyncio.gather(
+                *(send(samples[0], measured=False) for _ in range(num_warmups))
+            )
+            warmup_succeeded = sum(output.success for output in warmup_outputs)
+            logger.info(
+                "warmup requests finished: sent=%d succeeded=%d failed=%d",
+                num_warmups,
+                warmup_succeeded,
+                num_warmups - warmup_succeeded,
+            )
 
         tasks: list[asyncio.Task[RequestFuncOutput]] = []
         progress: Any | None = None
@@ -237,16 +284,24 @@ async def benchmark(
 
         # Exclude model discovery, readiness checks, and warmup from the
         # reported measurement window, matching benchmark convention.
+        logger.info("sending measured requests: count=%d", len(samples))
         started = time.perf_counter()
         try:
             async for sample, _ in get_request(
                 samples, request_rate, burstiness=burstiness, self_timed=self_timed
             ):
-                task = asyncio.create_task(send(sample))
+                task = asyncio.create_task(send(sample, measured=True))
                 if progress is not None:
                     task.add_done_callback(lambda _: progress.update())
                 tasks.append(task)
             outputs = await asyncio.gather(*tasks)
+        except Exception:
+            logger.exception(
+                "benchmark task failed: sent_requests=%d planned_requests=%d",
+                measured_sent,
+                len(samples),
+            )
+            raise
         finally:
             if progress is not None:
                 progress.close()
@@ -271,6 +326,14 @@ async def benchmark(
         }
         for sample, output in zip(samples, outputs, strict=True)
     ]
+    logger.info(
+        "benchmark task finished: sent_requests=%d succeeded=%d failed=%d "
+        "duration_s=%.3f",
+        measured_sent,
+        result["completed"],
+        result["failed"],
+        duration,
+    )
     return result
 
 

@@ -32,6 +32,7 @@ requests, measures client-observable latency and throughput, and emits terminal 
 - 支持确定性、共享 prefix、本地文件和 Hugging Face Hub workload。
 - 测量 TTFT、TTOP、TTLT、ITL、吞吐、并发和百分位数等指标。
 - 提供 CLI 和 Python API，并将结果保存为可分析的 JSON。
+- 每次 benchmark 任务输出请求规模、目标、warmup 和完成汇总日志。
 - 在请求失败、超时和 SSE 解析异常时保留逐请求错误信息。
 
 ## 非目标
@@ -191,7 +192,7 @@ classDiagram
     Metrics ..> JsonOutput : serializes
 ```
 
-入口层负责解析 CLI 或暴露 Python API；工作负载层将数据转换为 `SampleRequest`；`serve.py` 负责调度和组装 backend 无关的请求输入；协议适配层按 `BACKENDS` 选择 API 路径及 SSE/JSON 解析器；指标层汇总 `RequestFuncOutput` 并输出终端和 JSON 结果。外部服务只通过 HTTP 协议与 benchmark client 交互。
+入口层负责解析 CLI 或暴露 Python API；工作负载层将数据转换为 `SampleRequest`；`serve.py` 负责调度、组装 backend 无关的请求输入并记录任务生命周期日志；协议适配层按 `BACKENDS` 选择 API 路径及 SSE/JSON 解析器；指标层汇总 `RequestFuncOutput` 并输出终端和 JSON 结果。外部服务只通过 HTTP 协议与 benchmark client 交互。
 
 ### 核心数据模型
 
@@ -221,6 +222,23 @@ RequestFuncOutput
 - LoRA 动态选择。
 
 HTTP、超时和 SSE/JSON 解析错误通常会转换为 `RequestFuncOutput.error` 并纳入失败统计。但 Rerank 输入不是至少两个元素的 list 时，`request_rerank()` 会抛出 `EndpointError`；该异常会经 `asyncio.gather()` 传播并终止本次 benchmark，而不是作为单请求失败结果返回。
+
+### 任务日志
+
+`serve.py` 使用 Python 标准库 `logging` 的模块 logger，不直接配置全局 handler。每次调用
+`benchmark()` 产生以下 INFO 事件：
+
+- 准备任务：measured request 数、warmup 数、backend、endpoint、model、request rate 和最大并发。
+- warmup 开始与结束：发送数、成功数和失败数。
+- measured request 开始：计划发送的请求数。
+- 任务结束：实际发送数、成功数、失败数和测量时长。
+
+如果请求调度或执行抛出未处理异常，记录已发送数量并保留 traceback 后继续向调用者抛出。
+单请求的 request ID、输入长度和期望输出长度只在 DEBUG 级别记录，避免高并发压测在 INFO
+级别刷屏。
+
+CLI 在调用 `run()` 前使用标准 `logging.basicConfig()` 将 INFO 及以上日志输出到 stderr；指标表格和
+JSON 结果继续使用 stdout。Python API 不主动配置全局 logging，由宿主应用决定 handler、格式和级别。
 
 ## 使用与验证
 
@@ -289,6 +307,7 @@ python -m test_serve \
 | `--header` | `NAME=VALUE`，可重复传入 |
 | `--percentiles` | 如 `50,90,99` |
 | `--goodput` | 如 `ttft=200` 或 `e2el=1000`，单位 ms |
+| `--log-level` | CLI 日志级别，默认 `INFO`；使用 `DEBUG` 查看单请求发送日志 |
 
 ### 数据集示例
 
@@ -401,7 +420,7 @@ benchmark 只依赖目标服务公开的 HTTP contract。新增 endpoint adapter
 
 ## 测试与评估
 
-独立 mock server 测试覆盖数据集加载、请求调度、基础指标、无限速率和 Chat SSE 解析。使用真实
+独立 mock server 测试覆盖数据集加载、请求调度、基础指标、无限速率、任务生命周期日志和 Chat SSE 解析。使用真实
 服务评估时，应记录服务模型、sampling 参数、数据集 seed、请求速率、并发数、warmup 策略和
 benchmark 版本。
 
@@ -412,6 +431,7 @@ benchmark 版本。
 - Client-only deployment keeps benchmark dependencies and failure modes independent of the server.
 - Common request and result models make different HTTP endpoints comparable.
 - Per-request records make aggregate metric regressions diagnosable.
+- Task lifecycle logs make request scale and completion state visible before final metrics are printed.
 
 ### 限制
 
@@ -435,4 +455,5 @@ vLLM internals.
 - CLI and Python API execute the documented workload modes.
 - Streaming and JSON endpoint adapters produce normalized request results.
 - Dataset, scheduling, metric, and error paths have automated coverage.
+- CLI configures INFO logging, while Python API logging remains host-controlled.
 - Metric definitions and known approximation boundaries are documented.

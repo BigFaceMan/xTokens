@@ -23,6 +23,8 @@ benchmark 中的 `print()` 用于向用户展示测试结果，不属于运行�
 - 定义 `process`、`local` 和 `global` 三种日志去重 scope。
 - 支持环境变量调整默认配置，以及通过 JSON `dictConfig` 完整接管日志。
 - 统一 Uvicorn error/access 日志格式，并保留 `--no-access-log` 行为。
+- 统一请求生命周期、Engine 启停和 Core 异常的 INFO/ERROR 事件。
+- 在 DEBUG 级别记录每次 Scheduler 调度和模型 step，便于分析 batch 变化。
 - 通过测试验证初始化幂等性、格式化、去重、rank 抑制和配置覆盖。
 
 ## Non-goals
@@ -66,6 +68,21 @@ flowchart TD
 ```
 
 ## Detailed Design
+
+### Logging Policy
+
+xTokens 生产模块按事件频率选择日志级别：
+
+| 级别 | 事件 |
+|---|---|
+| `INFO` | Engine 初始化/就绪/关闭；请求开始、正常结束、错误结束和取消 |
+| `DEBUG` | 每次 Scheduler 调度的 batch/waiting/running/request IDs；模型 step 耗时 |
+| `WARNING` | 请求级 Engine error event，以及不影响进程存活的异常状态 |
+| `ERROR` | executor/采样异常等导致整个 batch 失败的异常，并保留 traceback |
+
+INFO 日志不得包含 prompt、chat message、API key 等用户内容。逐 token 调度日志必须放在 DEBUG，
+避免默认 INFO 配置在生成期间刷屏或引入明显的日志 I/O 开销；需要排查调度行为时通过
+`XTOKENS_LOGGING_LEVEL=DEBUG` 显式开启。
 
 ### Core Flow
 
@@ -238,12 +255,15 @@ logger = init_logger(__name__)
 - 自定义 JSON 配置完整接管及非法配置快速失败。
 - Uvicorn error/access logger 配置和 `access_log=False` 传递。
 - 现有 generation exception 日志行为不回退。
+- 请求开始、完成、错误和取消日志包含 request ID，完成日志包含 finish reason、token 数和耗时。
+- 每次 Scheduler `schedule()` 调用产生 DEBUG batch 状态日志。
+- executor/采样异常产生带 traceback 的 ERROR 日志。
 
 导入时初始化和环境变量组合使用 subprocess 隔离测试，避免 pytest 进程中全局 logging 状态相互影响。Python 代码运行 ruff，相关测试运行 pytest。
 
 本次变更不是性能优化，不要求 GPU Benchmark。关闭级别的标准 logging 调用仍保持延迟格式化，不在调用点构造完整消息。
 
-最终验证结果：全量 `pytest -q` 共 54 项测试通过；本次修改涉及的 Python 文件通过 `ruff check`。全仓 `ruff check .` 仍被 benchmark 目录中 9 个与本设计无关的既有问题阻塞，包括未使用变量、导入排序和宽泛异常捕获，本次改动未扩大范围处理这些问题。
+最终验证结果：全量 `pytest -q` 共 63 项测试通过；本次修改涉及的 Python 文件通过 `ruff check` 和 `ruff format --check`。全仓 `ruff check .` 仍被 benchmark 目录中 8 个与本设计无关的既有问题阻塞，包括未使用变量、导入排序和宽泛异常捕获，本次改动未扩大范围处理这些问题。
 
 ## Trade-offs and Known Issues
 

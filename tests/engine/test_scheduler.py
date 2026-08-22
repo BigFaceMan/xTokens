@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+from unittest.mock import Mock
+
+from x_tokens.core import scheduler as scheduler_module
 from x_tokens.core.scheduler import NaiveScheduler, RequestStatus
 from x_tokens.engine.types import FinishReason, GenerateRequest, SamplingParams
 
@@ -37,6 +41,29 @@ def test_scheduler_admits_requests_in_fifo_batches() -> None:
 
     third_batch = scheduler.schedule()
     assert [item.request_id for item in third_batch.requests] == ["three"]
+
+
+def test_scheduler_logs_every_scheduled_batch(monkeypatch) -> None:
+    debug = Mock()
+    monkeypatch.setattr(
+        scheduler_module.logger,
+        "isEnabledFor",
+        lambda level: level == logging.DEBUG,
+    )
+    monkeypatch.setattr(scheduler_module.logger, "debug", debug)
+    scheduler = NaiveScheduler(max_num_seqs=1, max_model_len=8)
+    scheduler.add_request(request("one"), (1,))
+
+    scheduler.schedule()
+    scheduler.schedule()
+
+    schedule_calls = [
+        call
+        for call in debug.call_args_list
+        if call.args[0].startswith("scheduler step:")
+    ]
+    assert len(schedule_calls) == 2
+    assert all(call.args[1] == 1 for call in schedule_calls)
 
 
 def test_scheduler_finishes_on_eos_and_length() -> None:

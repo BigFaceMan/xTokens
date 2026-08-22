@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
 from ..engine.types import FinishReason, GenerateRequest
+from ..logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class RequestStatus(StrEnum):
@@ -106,27 +110,56 @@ class NaiveScheduler(Scheduler):
             raise ValueError("prompt exceeds max_model_len")
         self.waiting.append(ScheduledRequest(request, prompt_token_ids))
         self._request_ids.add(request.request_id)
+        logger.debug(
+            "scheduler request queued: request_id=%s prompt_tokens=%d "
+            "max_tokens=%d waiting=%d running=%d",
+            request.request_id,
+            len(prompt_token_ids),
+            request.sampling.max_tokens,
+            len(self.waiting),
+            len(self.running),
+        )
 
     def abort(self, request_id: str) -> bool:
         request = self.running.pop(request_id, None)
         if request is not None:
             request.status = RequestStatus.ABORTED
             self._request_ids.discard(request_id)
+            logger.debug(
+                "scheduler request aborted: request_id=%s state=running", request_id
+            )
             return True
         for request in tuple(self.waiting):
             if request.request_id == request_id:
                 self.waiting.remove(request)
                 request.status = RequestStatus.ABORTED
                 self._request_ids.discard(request_id)
+                logger.debug(
+                    "scheduler request aborted: request_id=%s state=waiting",
+                    request_id,
+                )
                 return True
         return False
 
     def schedule(self) -> SchedulerOutput:
+        admitted = 0
         while self.waiting and len(self.running) < self._max_num_seqs:
             request = self.waiting.popleft()
             request.status = RequestStatus.RUNNING
             self.running[request.request_id] = request
-        return SchedulerOutput(tuple(self.running.values()))
+            admitted += 1
+        batch = SchedulerOutput(tuple(self.running.values()))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "scheduler step: batch_size=%d admitted=%d waiting=%d running=%d "
+                "request_ids=%s",
+                len(batch.requests),
+                admitted,
+                len(self.waiting),
+                len(self.running),
+                tuple(request.request_id for request in batch.requests),
+            )
+        return batch
 
     def update_from_output(
         self,
@@ -154,6 +187,13 @@ class NaiveScheduler(Scheduler):
                 request.status = RequestStatus.FINISHED
                 self.running.pop(request.request_id)
                 self._request_ids.discard(request.request_id)
+                logger.debug(
+                    "scheduler request finished: request_id=%s finish_reason=%s "
+                    "completion_tokens=%d",
+                    request.request_id,
+                    finish_reason.value,
+                    request.completion_tokens,
+                )
             updates.append(SchedulerUpdate(request, token_id, finish_reason))
         return tuple(updates)
 

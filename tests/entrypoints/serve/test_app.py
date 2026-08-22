@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
 
@@ -20,6 +21,7 @@ from x_tokens.engine.types import (
 )
 from x_tokens.entrypoints.serve import ServeConfig, create_app
 from x_tokens.entrypoints.serve import app as serve_app
+from x_tokens.entrypoints.serve import generation as generation_module
 from x_tokens.entrypoints.serve.generation import GenerationService
 from x_tokens.entrypoints.serve.models import ModelRegistry
 from x_tokens.executor.base import Executor, ModelForwardOutput
@@ -165,8 +167,10 @@ def test_chat_stream_includes_usage_and_late_error() -> None:
         assert engine.calls[0].sampling.ignore_eos is True
 
 
-def test_unfinished_event_stream_aborts_request() -> None:
+def test_unfinished_event_stream_aborts_request(monkeypatch) -> None:
     engine = FakeEngine()
+    info = Mock()
+    monkeypatch.setattr(generation_module.logger, "info", info)
     service = GenerationService(engine, ModelRegistry("test-model"))
     request = GenerateRequest("cancel-me", "test-model", "hello", SamplingParams(2))
 
@@ -177,6 +181,27 @@ def test_unfinished_event_stream_aborts_request() -> None:
 
     asyncio.run(close_early())
     assert engine.aborted == ["cancel-me"]
+    assert any(
+        call.args[0].startswith("request cancelled:") for call in info.call_args_list
+    )
+
+
+def test_finished_event_stream_logs_request_lifecycle(monkeypatch) -> None:
+    engine = FakeEngine()
+    info = Mock()
+    monkeypatch.setattr(generation_module.logger, "info", info)
+    service = GenerationService(engine, ModelRegistry("test-model"))
+    request = GenerateRequest("logged", "test-model", "hello", SamplingParams(2))
+
+    async def consume() -> None:
+        async for _ in service.events(request):
+            pass
+
+    asyncio.run(consume())
+
+    messages = [call.args[0] for call in info.call_args_list]
+    assert any(message.startswith("request started:") for message in messages)
+    assert any(message.startswith("request finished:") for message in messages)
 
 
 def test_default_factory_uses_inproc_llm_engine(monkeypatch) -> None:

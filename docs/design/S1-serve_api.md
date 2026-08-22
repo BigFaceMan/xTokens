@@ -126,6 +126,9 @@ flowchart TD
 7. Engine 调用 `OutputProcessor.process_token()` 将 Core token ID 转为文本，并归一化为
    `TokenEvent`、`FinishedEvent` 或 `ErrorEvent`。终止事件结束该
    request 的 generator；若 generator 在终止前结束，`finally` 调用 `abort_requests()`。
+8. `GenerationService.events()` 在请求开始和离开时记录 INFO 生命周期日志。正常完成包含
+   finish reason、prompt/completion token 和耗时；错误事件记录 WARNING；超时、断连或调用者提前
+   关闭 generator 时记录取消和耗时。日志不记录 prompt 或 chat message 正文。
 
 #### Non-Streaming Responses
 

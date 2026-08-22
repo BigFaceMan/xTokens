@@ -1,11 +1,20 @@
-# `test_serve` 独立 Serving Benchmark 设计
+# 设计文档：test_serve Serving Benchmark
+
+## 摘要
+
+`test_serve` is an independent asynchronous benchmark client for already-running
+OpenAI-compatible services. It normalizes datasets and request workloads, sends streaming or JSON
+requests, measures client-observable latency and throughput, and emits terminal and JSON results.
+它不负责启动或配置目标服务。
+
+## 背景
 
 实现位置：`/Code/xTokens/benchmarks/test_serve`
 
 `test_serve` 是一个独立的异步 benchmark client，用于压测已经运行的 OpenAI-compatible HTTP 服务。它不导入、不启动、不配置 vLLM 或 xTokens；模型、GPU、调度器、KV cache 和服务端生命周期均由外部服务负责。
 
 
-**对于系统的性能主要看以下几个方面：**
+`test_serve` evaluates system behavior from the client side. The primary dimensions are:
 
 ``` md
 1. 性能
@@ -17,9 +26,23 @@
 ```
 
 
-## 1. 功能
+## 目标
 
-### 1.1 支持的 API
+- 支持 OpenAI-compatible completion/chat、embedding 和 rerank endpoint。
+- 支持确定性、共享 prefix、本地文件和 Hugging Face Hub workload。
+- 测量 TTFT、TTOP、TTLT、ITL、吞吐、并发和百分位数等指标。
+- 提供 CLI 和 Python API，并将结果保存为可分析的 JSON。
+- 在请求失败、超时和 SSE 解析异常时保留逐请求错误信息。
+
+## 非目标
+
+- 不启动、停止或配置被测服务，不管理 GPU、模型、scheduler 或 KV cache。
+- 不实现服务端 Prometheus、Timeline、ramp-up 或可视化系统。
+- 不保证 SSE delta 级指标等价于严格逐 token 指标。
+
+## 整体设计
+
+### 支持的 API
 
 | backend | 请求路径 | 响应方式 |
 | --- | --- | --- |
@@ -30,7 +53,7 @@
 
 生成接口会请求 `stream: true` 和 `stream_options.include_usage: true`。SSE 解析器支持 event 被拆分到多个 TCP chunk、一个 chunk 包含多个 event，以及 `data: [DONE]` 结束标记。
 
-### 1.2 数据集与流量
+### 数据集与流量模型
 
 `dataset.load_samples()` 将所有数据统一为 `list[SampleRequest]`。支持：
 
@@ -51,7 +74,7 @@ Hub 数据集使用 `--dataset-config` 选择配置，使用 `--dataset-split` �
 
 `--max-concurrency` 同时限制 `aiohttp.TCPConnector` 的连接数和 `asyncio.Semaphore` 的执行并发。
 
-### 1.3 请求配置与结果
+### 请求配置与结果
 
 - 未传 `model` 时，先从 `/v1/models` 选择第一个模型。若该接口返回 404/405，则查询 `/status`，从 `prefill_nodes` 或 `decode_nodes` 的后端继续查询 `/v1/models`。
 - 默认执行 readiness check：使用第一个样本发送真实请求，每 2 秒重试，直到成功或超时。
@@ -64,9 +87,9 @@ Hub 数据集使用 `--dataset-config` 选择配置，使用 `--dataset-split` �
 
 Embedding/Rerank 是非流式 JSON 请求：完整响应 latency 同时被记录为 TTFT。服务端 usage 中的 `prompt_tokens`/`input_tokens` 会覆盖本地输入长度估算；没有 output usage 时，生成输出 token 数回退为收到的生成事件数量。
 
-## 2. 架构
+## 详细设计
 
-### 2.1 目录结构
+### 目录结构
 
 ```text
 test_serve/
@@ -86,7 +109,7 @@ test_serve/
     └── test_standalone.py    # 标准库 mock server 测试
 ```
 
-### 2.2 组件架构
+### 组件架构
 
 ```mermaid
 classDiagram
@@ -170,7 +193,7 @@ classDiagram
 
 入口层负责解析 CLI 或暴露 Python API；工作负载层将数据转换为 `SampleRequest`；`serve.py` 负责调度和组装 backend 无关的请求输入；协议适配层按 `BACKENDS` 选择 API 路径及 SSE/JSON 解析器；指标层汇总 `RequestFuncOutput` 并输出终端和 JSON 结果。外部服务只通过 HTTP 协议与 benchmark client 交互。
 
-### 2.3 核心模型
+### 核心数据模型
 
 ```text
 SampleRequest
@@ -188,7 +211,7 @@ RequestFuncOutput
 
 `lib.endpoint.BACKENDS` 将 backend 名称映射为 `(URL suffix, async request function)`，使 `serve.py` 不依赖具体 API 协议。
 
-### 2.4 边界和限制
+### 边界与错误处理
 
 当前代码不提供：
 
@@ -199,9 +222,9 @@ RequestFuncOutput
 
 HTTP、超时和 SSE/JSON 解析错误通常会转换为 `RequestFuncOutput.error` 并纳入失败统计。但 Rerank 输入不是至少两个元素的 list 时，`request_rerank()` 会抛出 `EndpointError`；该异常会经 `asyncio.gather()` 传播并终止本次 benchmark，而不是作为单请求失败结果返回。
 
-## 3. 使用方法
+## 使用与验证
 
-### 3.1 环境与服务
+### 环境与目标服务
 
 运行环境需要 Python 3.10+ 与 `aiohttp`：
 
@@ -223,7 +246,7 @@ uv pip install --python .venv/bin/python -e '.[benchmark]'
 vllm serve <model> --host 127.0.0.1 --port 8000
 ```
 
-### 3.2 CLI
+### 命令行
 
 从项目根目录运行：
 
@@ -266,7 +289,7 @@ python -m test_serve \
 | `--percentiles` | 如 `50,90,99` |
 | `--goodput` | 如 `ttft=200` 或 `e2el=1000`，单位 ms |
 
-### 3.3 数据集示例
+### 数据集示例
 
 最大压力：
 
@@ -299,7 +322,7 @@ python -m test_serve \
 
 数据集记录必须包含可转换为文本的 `prompt`、`text`、`question`、`input` 或 `messages` 字段。对其他 schema，应先在 Hub 上使用合适的 config/split，或导出为 `custom` 格式。
 
-### 3.4 本地 JSONL
+### 本地 JSONL
 
 ```bash
 python -m test_serve \
@@ -322,7 +345,7 @@ python -m test_serve \
 
 `prompt` 也可以写为 `text`、`question`、`input`，或使用 `messages`。`trace` 数据集配合 `--self-timed` 使用 `timestamp` 回放请求时间。
 
-### 3.5 Python API
+### Python API
 
 ```python
 import asyncio
@@ -361,10 +384,54 @@ request_id, success, latency_ms, ttft_ms, itl_ms,
 input_tokens, output_tokens, error
 ```
 
-### 3.6 测试
+### 测试
 
 现有测试使用标准库 mock server 覆盖随机数据集、基础指标、无限速率调度和 Chat SSE 请求：
 
 ```bash
 python -m unittest test_serve.tests.test_standalone
 ```
+
+## 兼容性与迁移
+
+benchmark 只依赖目标服务公开的 HTTP contract。新增 endpoint adapter 时，应只扩展 `BACKENDS`，
+不修改数据集规范化和指标聚合逻辑。现有结果字段保持稳定；新增指标应采用向后兼容的方式，
+并明确其测量边界。
+
+## 测试与评估
+
+独立 mock server 测试覆盖数据集加载、请求调度、基础指标、无限速率和 Chat SSE 解析。使用真实
+服务评估时，应记录服务模型、sampling 参数、数据集 seed、请求速率、并发数、warmup 策略和
+benchmark 版本。
+
+## 权衡与已知问题
+
+### 优点
+
+- Client-only deployment keeps benchmark dependencies and failure modes independent of the server.
+- Common request and result models make different HTTP endpoints comparable.
+- Per-request records make aggregate metric regressions diagnosable.
+
+### 限制
+
+- TTFT/ITL/TPOT are measured at received SSE delta boundaries and may be approximate.
+- Server-side queueing, GPU utilization, and kernel-level metrics are not directly observed.
+- Some endpoint-specific malformed inputs can still propagate as benchmark-level exceptions.
+
+### 权衡
+
+benchmark 优先保证协议独立性和客户端测量的可复现性，而不是深度接入服务端 instrumentation。
+后续可以关联服务端指标，但将其排除在 client 之外可以避免 benchmark 依赖某一种 serving 实现。
+
+## 结论
+
+`test_serve` provides a repeatable workload and measurement layer for comparing OpenAI-compatible
+serving implementations. Its API and result model are intentionally independent from xTokens and
+vLLM internals.
+
+## 完成标准
+
+- CLI and Python API execute the documented workload modes.
+- Streaming and JSON endpoint adapters produce normalized request results.
+- Dataset, scheduling, metric, and error paths have automated coverage.
+- Metric definitions and known approximation boundaries are documented.

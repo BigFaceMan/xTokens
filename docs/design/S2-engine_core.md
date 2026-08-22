@@ -1,12 +1,19 @@
-# 构建仅处理 token IDs 的通用同步 EngineCore
+# 设计文档：Token-ID EngineCore
 
-## 1. 背景
+## 摘要
+
+`EngineCore` is a synchronous, backend-independent token-ID execution loop. It validates requests,
+delegates admission and lifecycle updates to the injected `Scheduler`, delegates model execution and
+sampling to the injected `Executor`, and emits normalized Core events. `NaiveScheduler` is the default
+implementation, while the protocol allows future scheduling strategies.
+
+## 背景
 
 `EngineCore` 是 xTokens 的同步推理后端。Serve 与 `LLMEngine` 已在 Core 外完成 chat rendering、tokenization 和输出文本解码；因此 Core 不应依赖 FastAPI、OpenAI DTO、tokenizer 或 Hugging Face 模型实现。
 
 当前需要一个可替换 executor 的最小 Core：它接收稳定的 token-ID 请求，维护请求生命周期和 batch 调度，并将 executor 的下一个 token ID 转为 Core events。
 
-## 2. 目标
+## 目标
 
 - 仅接收 `GenerateRequest.prompt: tuple[int, ...]`，拒绝文本 prompt。
 - 负责模型别名和 sampling 参数校验、FIFO 准入、运行状态、取消和关闭。
@@ -15,7 +22,13 @@
 
 不包含 tokenization、chat template、detokenization、HTTP/SSE、KV cache 或 Core worker/IPC。
 
-## 3. 整体设计
+## 非目标
+
+- 不处理文本 tokenization、chat template、detokenization、HTTP/SSE 或 OpenAI DTO。
+- 不实现 KV cache、prefix cache、优先级、抢占、chunked prefill 或异步 Core worker。
+- 不把具体模型框架类型暴露到 Core contract。
+
+## 整体设计
 
 ```mermaid
 flowchart LR
@@ -31,14 +44,14 @@ flowchart LR
 
 Serve 层的 `default_engine_factory` 同样接受可选的 `executor_factory` 和 `scheduler_factory`。`ServeConfig` 只承载可序列化的模型与运行参数，factory 用于替换 Python 实现，避免将 callable 放入配置对象。
 
-## 4. 详细设计
+## 详细设计
 
-### 4.1 核心流程
+### 核心流程
 
 1. Engine 预处理文本为 token IDs，并调用 `EngineCore.add_request()`。
 2. Core 校验模型、token-ID 类型与 sampling；失败则暂存 `CoreErrorEvent`，成功则加入 waiting 队列。
 3. `step_fn()` 先取出暂存事件，再由 `Scheduler.schedule()` 将请求填入 running batch；默认实现以 FIFO 纳入请求，上限为 `max_num_seqs`。
-4. Core 调用 `Executor.execute_model(batch)` 获取 `ModelForwardOutput`。
+4. Core 调用 `Executor.execute_model(SchedulerOutput)` 获取 `ModelForwardOutput`。
 5. Core 将 forward 输出交给 `Executor.sample_tokens(output, SchedulerOutput)`，每个 running request 得到一个 token ID。
 6. Scheduler 追加 token 并依据 EOS、`max_tokens` 或 `max_model_len` 计算完成状态。非 EOS token 产生 `CoreTokenEvent`；完成请求额外产生 `CoreFinishedEvent`。
 7. forward 或采样失败时 Core 调用 `fail_batch()`，向仍在该 batch 中的请求分别产生 `CoreErrorEvent`。
@@ -55,9 +68,9 @@ sequenceDiagram
     E->>C: step_fn()
     C->>S: schedule()
     S-->>C: SchedulerOutput
-    C->>X: execute_model(batch)
+    C->>X: execute_model(SchedulerOutput)
     X-->>C: ModelForwardOutput
-    C->>X: sample_tokens(output, batch)
+    C->>X: sample_tokens(output, SchedulerOutput)
     X-->>C: token IDs
     C->>S: update_from_output()
     C-->>E: EngineCoreOutputs
@@ -65,7 +78,7 @@ sequenceDiagram
 
 `abort_requests()` 可从 waiting 或 running 移除 request。`close()` 标记 Core closed 并 abort 全部 scheduler 请求；关闭后的新增请求会产生 `CoreErrorEvent`。
 
-### 4.2 接口 / 数据结构
+### 接口与数据结构
 
 ```python
 class Executor(Protocol):
@@ -110,7 +123,7 @@ class EngineCore:
 | `ScheduledRequest` | 已处理 prompt token IDs、输出 token IDs 与调度状态。 |
 | `EngineCoreOutputs` | 按 output channel 组织的本 step Core events；当前使用 channel `0`。 |
 
-### 4.3 状态图
+### 状态图
 
 ```mermaid
 stateDiagram-v2
@@ -126,7 +139,14 @@ stateDiagram-v2
     Failed --> [*]
 ```
 
-## 5. 测试与验证
+### 兼容性与迁移
+
+`EngineCore` keeps a token-ID input and Core-event output boundary. Existing callers continue to use
+the default `NaiveScheduler`; custom schedulers can be injected through `EngineCore` or `InprocClient`.
+`SchedulerOutput` 表示 `Scheduler.schedule()` 的调度结果，`SchedulerUpdate` 表示单个请求的
+生命周期更新。
+
+## 测试与评估
 
 - `tests/engine/test_scheduler.py` 验证 FIFO、并发上限、完成与取消。
 - `tests/engine/test_hf_core.py` 用 `FakeExecutor` 验证 token-ID 边界、batch event 顺序、错误隔离和文本 prompt 拒绝。
@@ -138,18 +158,31 @@ uv run ruff format --check x_tokens tests
 uv run pytest -q tests/engine
 ```
 
-## 6. Trade-offs / 已知问题
+## 权衡与已知问题
 
 ### 优点
 
 - Core 输入和输出都是稳定的 token-ID/Core-event contract，易于替换 scheduler、executor 或 transport。
 - 调度测试不需要 tokenizer、torch 或 transformers。
 
-### 缺点 / 限制
+### 限制
 
 - `step_fn()` 是同步接口；in-process HF forward 会阻塞调用线程。
 - 当前 scheduler 没有 KV cache、优先级、抢占、prefix cache 或 chunked prefill。
 
-### Trade-offs
+### 权衡
+
+
+## 结论
+
+`EngineCore` 现在具备稳定的 token-ID contract，以及明确的 scheduler/executor 边界。在保持正确性
+基线简洁的同时，可以引入新的调度和执行实现，而无需将协议或 tokenizer 逻辑移动到 Core。
+
+## 完成标准
+
+- Core rejects invalid text prompts and validates model/sampling constraints.
+- Scheduler and executor failures produce request-scoped `CoreErrorEvent` events.
+- Scheduler injection and default `NaiveScheduler` behavior are tested.
+- `pytest`, Ruff checks, and formatting checks pass.
 
 通过 `Scheduler` protocol 注入调度策略，以简单的默认实现保持当前行为，同时为连续批处理等策略保留扩展点。同步 pull Core 以简单、可测试的执行语义换取独立 worker 和异步背压能力。

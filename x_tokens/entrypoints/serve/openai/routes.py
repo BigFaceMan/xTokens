@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -13,6 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from x_tokens.config import ServerConfig
 from x_tokens.engine.llm_engine import LLMEngineProtocol
 from x_tokens.engine.types import EngineEvent, ErrorEvent
+from x_tokens.logger import init_logger
 
 from ..errors import EngineRequestError, OpenAIError
 from ..generation import ChatCompletionService, GenerationService
@@ -30,7 +30,7 @@ from .adapter import (
 from .protocol import ChatCompletionRequest, CompletionRequest
 from .sse import SSE_HEADERS
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 router = APIRouter()
 
 

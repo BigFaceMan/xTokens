@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import AsyncIterator
 
 from x_tokens.engine.llm_engine import LLMEngineProtocol
@@ -13,13 +12,14 @@ from x_tokens.engine.types import (
     FinishedEvent,
     GenerateRequest,
 )
+from x_tokens.logger import init_logger
 
 from .errors import EngineUnavailableError
 from .models import ModelRegistry
 from .openai.protocol import ChatMessage
 from .renderer import PromptRenderer
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 
 class GenerationService:

@@ -14,6 +14,7 @@ from x_tokens.config import (
     ServerConfig,
     XTokensConfig,
 )
+from x_tokens.logger import create_uvicorn_log_config
 
 from .app import create_app
 
@@ -69,6 +70,7 @@ def main(argv: list[str] | None = None) -> None:
         host=config.server_config.host,
         port=config.server_config.port,
         access_log=config.server_config.access_log,
+        log_config=create_uvicorn_log_config(),
     )
 
 
